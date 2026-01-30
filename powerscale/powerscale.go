@@ -1285,3 +1285,705 @@ func (rl *ReplicationLog) GetNextSequence() uint64 {
 func generateVolumeID() string {
     return fmt.Sprintf("vol-%d", time.Now().UnixNano())
 }
+
+// ============================================================================
+// NVMe Deep Dive Implementation
+// ============================================================================
+
+// NVMeSubsystem represents an NVMe storage subsystem
+type NVMeSubsystem struct {
+    // Subsystem identification
+    SubsystemNQN    string  // NVMe Qualified Name
+    SubsystemID     string
+
+    // Controllers
+    controllers     map[int]*NVMeController
+    controllersMu   sync.RWMutex
+
+    // Namespaces
+    namespaces      map[uint32]*NVMeNamespace
+    namespacesMu    sync.RWMutex
+
+    // NVMe-oF (NVMe over Fabrics)
+    fabricsEnabled  bool
+    transports      map[string]*NVMeFabricsTransport
+
+    // Performance
+    queues          *NVMeQueueManager
+
+    // Configuration
+    config          *NVMeConfig
+}
+
+// NVMeController represents an NVMe controller
+type NVMeController struct {
+    ControllerID    int
+    PCIeAddress     string
+
+    // Controller capabilities
+    MaxQueueEntries uint16
+    MaxNamespaces   uint32
+    MaxTransferSize uint32
+
+    // I/O Queue Pairs
+    ioQueues        []*NVMeQueuePair
+    adminQueue      *NVMeQueuePair
+
+    // Controller state
+    State           ControllerState
+    Enabled         bool
+
+    // Statistics
+    Stats           *ControllerStats
+}
+
+type ControllerState int
+
+const (
+    ControllerStateIdle ControllerState = iota
+    ControllerStateActive
+    ControllerStateFailed
+)
+
+// NVMeNamespace represents an NVMe namespace (equivalent to a LUN)
+type NVMeNamespace struct {
+    NamespaceID     uint32
+    NGUID           string  // Namespace Globally Unique Identifier
+    UUID            string
+
+    // Capacity
+    Size            uint64  // in bytes
+    BlockSize       uint32  // typically 4096
+    NumBlocks       uint64
+
+    // Namespace type
+    Type            NamespaceType
+
+    // ZNS (Zoned Namespace) specific
+    ZNSConfig       *ZonedNamespaceConfig
+
+    // Data protection
+    PIType          uint8   // Protection Information Type
+    MetadataSize    uint16
+
+    // Access
+    SharedNamespace bool
+    Multipath       bool
+
+    // Performance
+    IOPSLimit       uint64
+    BandwidthLimit  uint64
+
+    // State
+    State           NamespaceState
+    Attached        bool
+}
+
+type NamespaceType int
+
+const (
+    NamespaceTypeBlock NamespaceType = iota
+    NamespaceTypeZoned  // ZNS
+    NamespaceTypeKeyValue
+)
+
+type NamespaceState int
+
+const (
+    NamespaceStateActive NamespaceState = iota
+    NamespaceStateInactive
+    NamespaceStateDegraded
+)
+
+// ZonedNamespaceConfig for ZNS (Zoned Namespace) support
+type ZonedNamespaceConfig struct {
+    ZoneSize        uint64
+    MaxOpenZones    uint32
+    MaxActiveZones  uint32
+
+    // Zone types
+    ZoneCapacity    uint64
+    ZoneDescriptors []*ZoneDescriptor
+
+    // ZNS operations
+    mu              sync.RWMutex
+}
+
+// ZoneDescriptor describes a single zone in ZNS
+type ZoneDescriptor struct {
+    ZoneID          uint64
+    ZoneType        ZoneType
+    ZoneState       ZoneState
+
+    // Addressing
+    StartLBA        uint64
+    Capacity        uint64
+    WritePointer    uint64
+
+    // Attributes
+    FinishedRecommended bool
+    ResetRecommended    bool
+}
+
+type ZoneType int
+
+const (
+    ZoneTypeSequentialWriteRequired ZoneType = iota
+    ZoneTypeSequentialWritePreferred
+    ZoneTypeRandom
+)
+
+type ZoneState int
+
+const (
+    ZoneStateEmpty ZoneState = iota
+    ZoneStateImplicitlyOpen
+    ZoneStateExplicitlyOpen
+    ZoneStateClosed
+    ZoneStateFull
+    ZoneStateReadOnly
+    ZoneStateOffline
+)
+
+// NVMeQueuePair represents submission and completion queues
+type NVMeQueuePair struct {
+    QueueID         uint16
+
+    // Submission Queue
+    SubmissionQueue *SubmissionQueue
+
+    // Completion Queue
+    CompletionQueue *CompletionQueue
+
+    // Queue depth
+    QueueDepth      uint16
+
+    // Performance
+    Stats           *QueueStats
+}
+
+// SubmissionQueue holds NVMe commands to be executed
+type SubmissionQueue struct {
+    QueueID         uint16
+    Entries         []*NVMeCommand
+    Head            uint16
+    Tail            uint16
+    Size            uint16
+
+    // Doorbell
+    DoorbellAddr    uint64
+
+    mu              sync.Mutex
+}
+
+// CompletionQueue holds command completion status
+type CompletionQueue struct {
+    QueueID         uint16
+    Entries         []*NVMeCompletion
+    Head            uint16
+    Tail            uint16
+    Size            uint16
+
+    // Doorbell
+    DoorbellAddr    uint64
+
+    // Interrupt
+    InterruptVector uint16
+
+    mu              sync.Mutex
+}
+
+// NVMeCommand represents an NVMe command
+type NVMeCommand struct {
+    Opcode          uint8
+    CommandID       uint16
+    NamespaceID     uint32
+
+    // Data pointer (PRP or SGL)
+    DataPtr         uint64
+    DataLength      uint32
+
+    // Command specific
+    CDW10           uint32
+    CDW11           uint32
+    CDW12           uint32
+    CDW13           uint32
+    CDW14           uint32
+    CDW15           uint32
+
+    // Timing
+    SubmittedAt     time.Time
+}
+
+// NVMeCompletion represents a command completion entry
+type NVMeCompletion struct {
+    CommandID       uint16
+    Status          uint16
+    SquareHead      uint16
+
+    // Result
+    DW0             uint32
+
+    // Phase tag
+    PhaseTag        bool
+
+    // Timing
+    CompletedAt     time.Time
+}
+
+// NVMe Command Opcodes
+const (
+    // Admin commands
+    NVMeAdminCreateIOCQ     = 0x05
+    NVMeAdminCreateIOSQ     = 0x01
+    NVMeAdminDeleteIOCQ     = 0x04
+    NVMeAdminDeleteIOSQ     = 0x00
+    NVMeAdminIdentify       = 0x06
+    NVMeAdminGetLogPage     = 0x02
+    NVMeAdminNamespaceAttach = 0x15
+    NVMeAdminNamespaceManage = 0x0D
+
+    // I/O commands
+    NVMeIORead              = 0x02
+    NVMeIOWrite             = 0x01
+    NVMeIOFlush             = 0x00
+    NVMeIOCompare           = 0x05
+    NVMeIOWriteZeroes       = 0x08
+
+    // ZNS commands
+    NVMeZNSZoneAppend       = 0x7D
+    NVMeZNSZoneManagementSend = 0x79
+    NVMeZNSZoneManagementRecv = 0x7A
+)
+
+// NVMeFabricsTransport handles NVMe-oF
+type NVMeFabricsTransport struct {
+    TransportType   TransportType
+    Address         string
+    Port            int
+
+    // Connection management
+    connections     map[string]*NVMeFabricsConnection
+    connMu          sync.RWMutex
+
+    // RDMA specific
+    rdmaConfig      *RDMAConfig
+
+    // TCP specific
+    tcpConfig       *TCPConfig
+}
+
+type TransportType int
+
+const (
+    TransportRDMA TransportType = iota
+    TransportTCP
+    TransportFC  // Fibre Channel
+)
+
+// NVMeFabricsConnection represents a fabric connection
+type NVMeFabricsConnection struct {
+    ConnectionID    string
+    HostNQN         string
+    SubsystemNQN    string
+
+    // Transport
+    Transport       TransportType
+    RemoteAddr      string
+
+    // Queue pairs over fabric
+    QueuePairs      []*NVMeQueuePair
+
+    // State
+    Connected       bool
+    LastHeartbeat   time.Time
+
+    // Performance
+    Latency         time.Duration
+    Bandwidth       uint64
+}
+
+// RDMAConfig for RDMA transport
+type RDMAConfig struct {
+    MaxInlineData   uint32
+    MaxSGE          uint32
+    CompletionQueueDepth uint32
+}
+
+// TCPConfig for TCP transport
+type TCPConfig struct {
+    TLS             bool
+    InOrderDelivery bool
+    HeaderDigest    bool
+    DataDigest      bool
+}
+
+// NVMeQueueManager manages queue allocation
+type NVMeQueueManager struct {
+    queues          sync.Map  // queueID -> *NVMeQueuePair
+    nextQueueID     uint16
+    mu              sync.Mutex
+
+    // Multi-queue
+    numQueues       int
+    queuesPerCore   int
+}
+
+// NVMeConfig holds NVMe subsystem configuration
+type NVMeConfig struct {
+    // Queue configuration
+    NumIOQueues     int
+    QueueDepth      uint16
+
+    // Namespace defaults
+    DefaultBlockSize uint32
+
+    // Performance
+    EnableMultiQueue bool
+    QueuesPerCPU     int
+
+    // Features
+    EnableZNS        bool
+    EnableMultipath  bool
+    EnableFabrics    bool
+
+    // Timeouts
+    IOTimeout        time.Duration
+}
+
+// ControllerStats tracks controller performance
+type ControllerStats struct {
+    TotalCommands   uint64
+    CompletedCommands uint64
+    FailedCommands  uint64
+
+    TotalBytesRead  uint64
+    TotalBytesWritten uint64
+
+    AverageLatency  time.Duration
+    mu              sync.RWMutex
+}
+
+// QueueStats tracks queue performance
+type QueueStats struct {
+    CommandsSubmitted uint64
+    CommandsCompleted uint64
+    QueueDepth        uint64
+
+    mu              sync.RWMutex
+}
+
+// NewNVMeSubsystem creates a new NVMe subsystem
+func NewNVMeSubsystem(nqn string, config *NVMeConfig) *NVMeSubsystem {
+    subsystem := &NVMeSubsystem{
+        SubsystemNQN:   nqn,
+        SubsystemID:    generateSubsystemID(),
+        controllers:    make(map[int]*NVMeController),
+        namespaces:     make(map[uint32]*NVMeNamespace),
+        transports:     make(map[string]*NVMeFabricsTransport),
+        fabricsEnabled: config.EnableFabrics,
+        config:         config,
+        queues:         &NVMeQueueManager{
+            numQueues:     config.NumIOQueues,
+            queuesPerCore: config.QueuesPerCPU,
+        },
+    }
+
+    return subsystem
+}
+
+// CreateController creates a new NVMe controller
+func (ns *NVMeSubsystem) CreateController(controllerID int) (*NVMeController, error) {
+    ns.controllersMu.Lock()
+    defer ns.controllersMu.Unlock()
+
+    if _, exists := ns.controllers[controllerID]; exists {
+        return nil, fmt.Errorf("controller %d already exists", controllerID)
+    }
+
+    controller := &NVMeController{
+        ControllerID:    controllerID,
+        MaxQueueEntries: ns.config.QueueDepth,
+        MaxNamespaces:   256,
+        MaxTransferSize: 128 * 1024, // 128KB
+        ioQueues:        make([]*NVMeQueuePair, 0),
+        State:           ControllerStateActive,
+        Enabled:         true,
+        Stats:           &ControllerStats{},
+    }
+
+    // Create admin queue (QID 0)
+    controller.adminQueue = &NVMeQueuePair{
+        QueueID:    0,
+        QueueDepth: 64,
+        SubmissionQueue: &SubmissionQueue{
+            QueueID: 0,
+            Size:    64,
+            Entries: make([]*NVMeCommand, 64),
+        },
+        CompletionQueue: &CompletionQueue{
+            QueueID: 0,
+            Size:    64,
+            Entries: make([]*NVMeCompletion, 64),
+        },
+        Stats: &QueueStats{},
+    }
+
+    // Create I/O queues
+    for i := 1; i <= ns.config.NumIOQueues; i++ {
+        qp := ns.createQueuePair(uint16(i), ns.config.QueueDepth)
+        controller.ioQueues = append(controller.ioQueues, qp)
+    }
+
+    ns.controllers[controllerID] = controller
+    return controller, nil
+}
+
+// createQueuePair creates a submission/completion queue pair
+func (ns *NVMeSubsystem) createQueuePair(queueID uint16, depth uint16) *NVMeQueuePair {
+    return &NVMeQueuePair{
+        QueueID:    queueID,
+        QueueDepth: depth,
+        SubmissionQueue: &SubmissionQueue{
+            QueueID: queueID,
+            Size:    depth,
+            Entries: make([]*NVMeCommand, depth),
+        },
+        CompletionQueue: &CompletionQueue{
+            QueueID:         queueID,
+            Size:            depth,
+            Entries:         make([]*NVMeCompletion, depth),
+            InterruptVector: queueID,
+        },
+        Stats: &QueueStats{},
+    }
+}
+
+// CreateNamespace creates a new NVMe namespace
+func (ns *NVMeSubsystem) CreateNamespace(size uint64, nsType NamespaceType) (*NVMeNamespace, error) {
+    ns.namespacesMu.Lock()
+    defer ns.namespacesMu.Unlock()
+
+    nsID := uint32(len(ns.namespaces) + 1)
+    blockSize := ns.config.DefaultBlockSize
+    if blockSize == 0 {
+        blockSize = 4096
+    }
+
+    namespace := &NVMeNamespace{
+        NamespaceID: nsID,
+        NGUID:       generateNGUID(),
+        UUID:        generateNamespaceUUID(),
+        Size:        size,
+        BlockSize:   blockSize,
+        NumBlocks:   size / uint64(blockSize),
+        Type:        nsType,
+        State:       NamespaceStateActive,
+        Attached:    true,
+    }
+
+    // Configure ZNS if requested
+    if nsType == NamespaceTypeZoned && ns.config.EnableZNS {
+        namespace.ZNSConfig = ns.createZNSConfig(size)
+    }
+
+    ns.namespaces[nsID] = namespace
+    return namespace, nil
+}
+
+// createZNSConfig creates a Zoned Namespace configuration
+func (ns *NVMeSubsystem) createZNSConfig(totalSize uint64) *ZonedNamespaceConfig {
+    zoneSize := uint64(256 * 1024 * 1024) // 256MB zones
+    numZones := totalSize / zoneSize
+
+    znsConfig := &ZonedNamespaceConfig{
+        ZoneSize:       zoneSize,
+        MaxOpenZones:   14,
+        MaxActiveZones: 32,
+        ZoneCapacity:   zoneSize,
+        ZoneDescriptors: make([]*ZoneDescriptor, numZones),
+    }
+
+    // Initialize zones
+    for i := uint64(0); i < numZones; i++ {
+        znsConfig.ZoneDescriptors[i] = &ZoneDescriptor{
+            ZoneID:       i,
+            ZoneType:     ZoneTypeSequentialWriteRequired,
+            ZoneState:    ZoneStateEmpty,
+            StartLBA:     i * (zoneSize / 4096), // Assuming 4K blocks
+            Capacity:     zoneSize,
+            WritePointer: i * (zoneSize / 4096),
+        }
+    }
+
+    return znsConfig
+}
+
+// SubmitCommand submits an NVMe command
+func (nc *NVMeController) SubmitCommand(cmd *NVMeCommand) error {
+    // Select queue (round-robin across I/O queues)
+    queueIdx := int(cmd.CommandID) % len(nc.ioQueues)
+    queue := nc.ioQueues[queueIdx]
+
+    queue.SubmissionQueue.mu.Lock()
+    defer queue.SubmissionQueue.mu.Unlock()
+
+    // Add command to submission queue
+    cmd.SubmittedAt = time.Now()
+    queue.SubmissionQueue.Entries[queue.SubmissionQueue.Tail] = cmd
+
+    // Update tail
+    queue.SubmissionQueue.Tail = (queue.SubmissionQueue.Tail + 1) % queue.SubmissionQueue.Size
+
+    // Update stats
+    queue.Stats.mu.Lock()
+    queue.Stats.CommandsSubmitted++
+    queue.Stats.QueueDepth++
+    queue.Stats.mu.Unlock()
+
+    // Ring doorbell (simulated)
+    go nc.processCommand(queue, cmd)
+
+    return nil
+}
+
+// processCommand processes an NVMe command
+func (nc *NVMeController) processCommand(qp *NVMeQueuePair, cmd *NVMeCommand) {
+    // Simulate command processing
+    time.Sleep(100 * time.Microsecond) // Simulate fast NVMe latency
+
+    // Create completion entry
+    completion := &NVMeCompletion{
+        CommandID:   cmd.CommandID,
+        Status:      0, // Success
+        CompletedAt: time.Now(),
+    }
+
+    // Add to completion queue
+    qp.CompletionQueue.mu.Lock()
+    qp.CompletionQueue.Entries[qp.CompletionQueue.Tail] = completion
+    qp.CompletionQueue.Tail = (qp.CompletionQueue.Tail + 1) % qp.CompletionQueue.Size
+    qp.CompletionQueue.mu.Unlock()
+
+    // Update stats
+    qp.Stats.mu.Lock()
+    qp.Stats.CommandsCompleted++
+    qp.Stats.QueueDepth--
+    qp.Stats.mu.Unlock()
+
+    nc.Stats.mu.Lock()
+    nc.Stats.CompletedCommands++
+    latency := time.Since(cmd.SubmittedAt)
+    nc.Stats.AverageLatency = (nc.Stats.AverageLatency + latency) / 2
+    nc.Stats.mu.Unlock()
+}
+
+// WriteZone writes to a ZNS zone (zone append)
+func (ns *NVMeNamespace) WriteZone(zoneID uint64, data []byte) error {
+    if ns.Type != NamespaceTypeZoned || ns.ZNSConfig == nil {
+        return fmt.Errorf("namespace is not ZNS-enabled")
+    }
+
+    ns.ZNSConfig.mu.Lock()
+    defer ns.ZNSConfig.mu.Unlock()
+
+    if zoneID >= uint64(len(ns.ZNSConfig.ZoneDescriptors)) {
+        return fmt.Errorf("invalid zone ID: %d", zoneID)
+    }
+
+    zone := ns.ZNSConfig.ZoneDescriptors[zoneID]
+
+    // Check zone state
+    if zone.ZoneState != ZoneStateEmpty && zone.ZoneState != ZoneStateImplicitlyOpen {
+        return fmt.Errorf("zone %d not in writable state: %d", zoneID, zone.ZoneState)
+    }
+
+    // Zone append - write at write pointer
+    dataBlocks := uint64(len(data)) / uint64(ns.BlockSize)
+    zone.WritePointer += dataBlocks
+
+    // Update zone state
+    if zone.WritePointer >= zone.StartLBA+(zone.Capacity/uint64(ns.BlockSize)) {
+        zone.ZoneState = ZoneStateFull
+    } else {
+        zone.ZoneState = ZoneStateImplicitlyOpen
+    }
+
+    return nil
+}
+
+// EnableNVMeOverFabrics enables NVMe-oF
+func (ns *NVMeSubsystem) EnableNVMeOverFabrics(transport TransportType, address string, port int) error {
+    fabricsTransport := &NVMeFabricsTransport{
+        TransportType: transport,
+        Address:       address,
+        Port:          port,
+        connections:   make(map[string]*NVMeFabricsConnection),
+    }
+
+    // Configure transport-specific settings
+    switch transport {
+    case TransportRDMA:
+        fabricsTransport.rdmaConfig = &RDMAConfig{
+            MaxInlineData:        4096,
+            MaxSGE:               16,
+            CompletionQueueDepth: 1024,
+        }
+    case TransportTCP:
+        fabricsTransport.tcpConfig = &TCPConfig{
+            TLS:             true,
+            InOrderDelivery: true,
+            HeaderDigest:    true,
+            DataDigest:      true,
+        }
+    }
+
+    key := fmt.Sprintf("%s:%d", address, port)
+    ns.transports[key] = fabricsTransport
+
+    return nil
+}
+
+// ConnectFabrics establishes an NVMe-oF connection
+func (nft *NVMeFabricsTransport) ConnectFabrics(hostNQN, subsystemNQN string) (*NVMeFabricsConnection, error) {
+    connID := generateConnectionID()
+
+    conn := &NVMeFabricsConnection{
+        ConnectionID:  connID,
+        HostNQN:       hostNQN,
+        SubsystemNQN:  subsystemNQN,
+        Transport:     nft.TransportType,
+        RemoteAddr:    fmt.Sprintf("%s:%d", nft.Address, nft.Port),
+        Connected:     true,
+        LastHeartbeat: time.Now(),
+        QueuePairs:    make([]*NVMeQueuePair, 0),
+    }
+
+    nft.connMu.Lock()
+    nft.connections[connID] = conn
+    nft.connMu.Unlock()
+
+    return conn, nil
+}
+
+// Helper functions
+func generateSubsystemID() string {
+    return fmt.Sprintf("subsys-%d", time.Now().UnixNano())
+}
+
+func generateNGUID() string {
+    return fmt.Sprintf("%032x", time.Now().UnixNano())
+}
+
+func generateNamespaceUUID() string {
+    return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+        time.Now().Unix(),
+        uint16(time.Now().Nanosecond()),
+        uint16(0x4000|time.Now().Nanosecond()>>16),
+        uint16(0x8000|(time.Now().Nanosecond()>>8)&0x3FFF),
+        time.Now().UnixNano()&0xFFFFFFFFFFFF)
+}
+
+func generateConnectionID() string {
+    return fmt.Sprintf("conn-%d", time.Now().UnixNano())
+}
