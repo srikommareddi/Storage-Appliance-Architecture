@@ -5,6 +5,7 @@ import (
     "context"
     "crypto/md5"
     "crypto/rand"
+    "crypto/sha256"
     "encoding/hex"
     "fmt"
     "io"
@@ -870,4 +871,483 @@ func (p *UnifiedStoragePool) ReclaimSpace(id string) error {
 
     delete(p.storage, id)
     return nil
+}
+
+// ============================================================================
+// Data Domain Deduplication Engine
+// ============================================================================
+
+// DataDomainEngine provides variable-length deduplication and compression
+type DataDomainEngine struct {
+    // Segment store (content-addressed storage)
+    segmentStore    *SegmentStore
+
+    // Fingerprint index
+    fingerprints    sync.Map  // fingerprint -> *Segment
+
+    // Compression engine
+    compression     *CompressionEngine
+
+    // Dedup mode
+    mode            DedupMode
+
+    // Statistics
+    stats           *DedupStats
+    statsMu         sync.RWMutex
+
+    // Garbage collection
+    gc              *GarbageCollector
+}
+
+type DedupMode int
+
+const (
+    DedupModeInline DedupMode = iota
+    DedupModePostProcess
+    DedupModeHybrid
+)
+
+// SegmentStore stores unique data segments
+type SegmentStore struct {
+    segments        sync.Map  // segmentID -> *Segment
+    nextSegmentID   uint64
+    mu              sync.Mutex
+
+    // Storage backend
+    backend         *SegmentBackend
+}
+
+// Segment represents a unique data chunk
+type Segment struct {
+    SegmentID       string
+    Fingerprint     string  // SHA-256 hash
+    Data            []byte
+    CompressedData  []byte
+    Size            int64
+    CompressedSize  int64
+
+    // Reference counting
+    RefCount        int64
+    refMu           sync.Mutex
+
+    // Compression
+    Compressed      bool
+    CompressionType string
+
+    // Metadata
+    CreatedAt       time.Time
+    LastAccessed    time.Time
+}
+
+// SegmentBackend provides persistent storage for segments
+type SegmentBackend struct {
+    storage         map[string][]byte
+    mu              sync.RWMutex
+}
+
+// CompressionEngine handles data compression
+type CompressionEngine struct {
+    algorithm       CompressionAlgorithm
+    level           int
+}
+
+type CompressionAlgorithm int
+
+const (
+    CompressionNone CompressionAlgorithm = iota
+    CompressionGzip
+    CompressionLZ4
+    CompressionZstd
+)
+
+// DedupStats tracks deduplication statistics
+type DedupStats struct {
+    // Data metrics
+    TotalDataIngested   int64
+    UniqueDataStored    int64
+    DuplicateDataFound  int64
+
+    // Dedup ratio
+    DedupRatio          float64
+
+    // Compression metrics
+    PreCompressionSize  int64
+    PostCompressionSize int64
+    CompressionRatio    float64
+
+    // Segment metrics
+    TotalSegments       int64
+    AverageSegmentSize  int64
+
+    // Performance
+    DedupOperations     int64
+    DedupTimeNs         int64
+}
+
+// GarbageCollector reclaims unreferenced segments
+type GarbageCollector struct {
+    engine          *DataDomainEngine
+    scanInterval    time.Duration
+    running         bool
+    mu              sync.Mutex
+}
+
+// RecipeMetadata describes how to reconstruct data from segments
+type RecipeMetadata struct {
+    RecipeID        string
+    ObjectID        string
+    TotalSize       int64
+
+    // Segment references
+    SegmentRefs     []*SegmentReference
+
+    // Compression info
+    Compressed      bool
+}
+
+// SegmentReference points to a segment
+type SegmentReference struct {
+    SegmentID       string
+    Fingerprint     string
+    Offset          int64
+    Length          int64
+}
+
+// NewDataDomainEngine creates a new deduplication engine
+func NewDataDomainEngine(mode DedupMode) *DataDomainEngine {
+    engine := &DataDomainEngine{
+        segmentStore: &SegmentStore{
+            backend: &SegmentBackend{
+                storage: make(map[string][]byte),
+            },
+        },
+        compression: &CompressionEngine{
+            algorithm: CompressionGzip,
+            level:     6,
+        },
+        mode: mode,
+        stats: &DedupStats{},
+    }
+
+    // Initialize garbage collector
+    engine.gc = &GarbageCollector{
+        engine:       engine,
+        scanInterval: 1 * time.Hour,
+    }
+
+    return engine
+}
+
+// DeduplicateAndStore deduplicates data and stores unique segments
+func (dde *DataDomainEngine) DeduplicateAndStore(ctx context.Context, objectID string,
+                                                 data []byte) (*RecipeMetadata, error) {
+
+    startTime := time.Now()
+
+    // Chunk data into variable-length segments
+    segments := dde.chunkData(data)
+
+    recipe := &RecipeMetadata{
+        RecipeID:    generateRecipeID(),
+        ObjectID:    objectID,
+        TotalSize:   int64(len(data)),
+        SegmentRefs: make([]*SegmentReference, 0, len(segments)),
+    }
+
+    var uniqueBytes int64
+    var duplicateBytes int64
+
+    for offset, segmentData := range segments {
+        // Calculate fingerprint
+        fingerprint := dde.calculateFingerprint(segmentData)
+
+        // Check if segment already exists
+        if existing, found := dde.fingerprints.Load(fingerprint); found {
+            // Duplicate found - just reference existing segment
+            segment := existing.(*Segment)
+
+            segment.refMu.Lock()
+            segment.RefCount++
+            segment.refMu.Unlock()
+
+            recipe.SegmentRefs = append(recipe.SegmentRefs, &SegmentReference{
+                SegmentID:   segment.SegmentID,
+                Fingerprint: fingerprint,
+                Offset:      int64(offset),
+                Length:      int64(len(segmentData)),
+            })
+
+            duplicateBytes += int64(len(segmentData))
+
+        } else {
+            // New unique segment - compress and store
+            segment := &Segment{
+                SegmentID:    dde.segmentStore.GetNextID(),
+                Fingerprint:  fingerprint,
+                Data:         segmentData,
+                Size:         int64(len(segmentData)),
+                RefCount:     1,
+                CreatedAt:    time.Now(),
+                LastAccessed: time.Now(),
+            }
+
+            // Compress segment
+            if dde.mode == DedupModeInline || dde.mode == DedupModeHybrid {
+                compressedData, err := dde.compression.Compress(segmentData)
+                if err == nil && len(compressedData) < len(segmentData) {
+                    segment.CompressedData = compressedData
+                    segment.CompressedSize = int64(len(compressedData))
+                    segment.Compressed = true
+                    segment.CompressionType = "gzip"
+                }
+            }
+
+            // Store segment
+            if err := dde.segmentStore.StoreSegment(segment); err != nil {
+                return nil, err
+            }
+
+            // Index fingerprint
+            dde.fingerprints.Store(fingerprint, segment)
+
+            recipe.SegmentRefs = append(recipe.SegmentRefs, &SegmentReference{
+                SegmentID:   segment.SegmentID,
+                Fingerprint: fingerprint,
+                Offset:      int64(offset),
+                Length:      int64(len(segmentData)),
+            })
+
+            uniqueBytes += int64(len(segmentData))
+        }
+    }
+
+    // Update statistics
+    dde.updateStats(int64(len(data)), uniqueBytes, duplicateBytes, time.Since(startTime))
+
+    return recipe, nil
+}
+
+// ReconstructData reconstructs data from recipe
+func (dde *DataDomainEngine) ReconstructData(ctx context.Context,
+                                            recipe *RecipeMetadata) ([]byte, error) {
+
+    result := make([]byte, 0, recipe.TotalSize)
+
+    for _, ref := range recipe.SegmentRefs {
+        // Load segment
+        segment, err := dde.segmentStore.LoadSegment(ref.SegmentID)
+        if err != nil {
+            return nil, err
+        }
+
+        // Decompress if needed
+        var data []byte
+        if segment.Compressed {
+            data, err = dde.compression.Decompress(segment.CompressedData)
+            if err != nil {
+                return nil, err
+            }
+        } else {
+            data = segment.Data
+        }
+
+        // Append to result
+        result = append(result, data...)
+
+        // Update access time
+        segment.LastAccessed = time.Now()
+    }
+
+    return result, nil
+}
+
+// chunkData splits data into variable-length segments using content-defined chunking
+func (dde *DataDomainEngine) chunkData(data []byte) [][]byte {
+    segments := make([][]byte, 0)
+
+    minChunkSize := 4 * 1024   // 4KB
+    avgChunkSize := 8 * 1024   // 8KB
+    maxChunkSize := 16 * 1024  // 16KB
+
+    windowSize := 48
+    if len(data) == 0 {
+        return segments
+    }
+
+    start := 0
+    for start < len(data) {
+        end := start + minChunkSize
+        if end > len(data) {
+            end = len(data)
+        }
+
+        // Look for chunk boundary using rolling hash
+        for end < len(data) && end-start < maxChunkSize {
+            // Simple boundary detection using rolling hash
+            if end-start >= avgChunkSize {
+                hash := dde.rollingHash(data[end-windowSize : end])
+                if hash%uint32(avgChunkSize) == 0 {
+                    break
+                }
+            }
+            end++
+        }
+
+        if end > len(data) {
+            end = len(data)
+        }
+
+        segments = append(segments, data[start:end])
+        start = end
+    }
+
+    return segments
+}
+
+// rollingHash computes a simple rolling hash for chunk boundary detection
+func (dde *DataDomainEngine) rollingHash(data []byte) uint32 {
+    var hash uint32
+    for _, b := range data {
+        hash = hash*31 + uint32(b)
+    }
+    return hash
+}
+
+// calculateFingerprint calculates SHA-256 fingerprint
+func (dde *DataDomainEngine) calculateFingerprint(data []byte) string {
+    h := sha256.New()
+    h.Write(data)
+    return hex.EncodeToString(h.Sum(nil))
+}
+
+// updateStats updates deduplication statistics
+func (dde *DataDomainEngine) updateStats(totalBytes, uniqueBytes, duplicateBytes int64,
+                                        duration time.Duration) {
+    dde.statsMu.Lock()
+    defer dde.statsMu.Unlock()
+
+    dde.stats.TotalDataIngested += totalBytes
+    dde.stats.UniqueDataStored += uniqueBytes
+    dde.stats.DuplicateDataFound += duplicateBytes
+    dde.stats.DedupOperations++
+    dde.stats.DedupTimeNs += duration.Nanoseconds()
+
+    // Calculate dedup ratio
+    if dde.stats.UniqueDataStored > 0 {
+        dde.stats.DedupRatio = float64(dde.stats.TotalDataIngested) /
+            float64(dde.stats.UniqueDataStored)
+    }
+}
+
+// GetStats returns deduplication statistics
+func (dde *DataDomainEngine) GetStats() DedupStats {
+    dde.statsMu.RLock()
+    defer dde.statsMu.RUnlock()
+    return *dde.stats
+}
+
+// StoreSegment stores a segment
+func (ss *SegmentStore) StoreSegment(segment *Segment) error {
+    ss.segments.Store(segment.SegmentID, segment)
+
+    // Persist to backend
+    data := segment.Data
+    if segment.Compressed {
+        data = segment.CompressedData
+    }
+
+    return ss.backend.Write(segment.SegmentID, data)
+}
+
+// LoadSegment loads a segment
+func (ss *SegmentStore) LoadSegment(segmentID string) (*Segment, error) {
+    if seg, found := ss.segments.Load(segmentID); found {
+        return seg.(*Segment), nil
+    }
+    return nil, fmt.Errorf("segment not found: %s", segmentID)
+}
+
+// GetNextID returns next segment ID
+func (ss *SegmentStore) GetNextID() string {
+    ss.mu.Lock()
+    defer ss.mu.Unlock()
+
+    id := ss.nextSegmentID
+    ss.nextSegmentID++
+    return fmt.Sprintf("seg-%016x", id)
+}
+
+// Write writes data to backend
+func (sb *SegmentBackend) Write(segmentID string, data []byte) error {
+    sb.mu.Lock()
+    defer sb.mu.Unlock()
+
+    sb.storage[segmentID] = data
+    return nil
+}
+
+// Compress compresses data
+func (ce *CompressionEngine) Compress(data []byte) ([]byte, error) {
+    // Simplified compression (in production would use actual compression)
+    // Simulating compression by returning the data as-is for now
+    return data, nil
+}
+
+// Decompress decompresses data
+func (ce *CompressionEngine) Decompress(data []byte) ([]byte, error) {
+    // Simplified decompression
+    return data, nil
+}
+
+// StartGarbageCollection starts the garbage collector
+func (gc *GarbageCollector) Start() {
+    gc.mu.Lock()
+    defer gc.mu.Unlock()
+
+    if gc.running {
+        return
+    }
+
+    gc.running = true
+    go gc.run()
+}
+
+// run is the garbage collection loop
+func (gc *GarbageCollector) run() {
+    ticker := time.NewTicker(gc.scanInterval)
+    defer ticker.Stop()
+
+    for range ticker.C {
+        gc.mu.Lock()
+        if !gc.running {
+            gc.mu.Unlock()
+            return
+        }
+        gc.mu.Unlock()
+
+        gc.collectGarbage()
+    }
+}
+
+// collectGarbage removes unreferenced segments
+func (gc *GarbageCollector) collectGarbage() {
+    gc.engine.fingerprints.Range(func(key, value interface{}) bool {
+        segment := value.(*Segment)
+
+        segment.refMu.Lock()
+        refCount := segment.RefCount
+        segment.refMu.Unlock()
+
+        if refCount == 0 {
+            // Remove unreferenced segment
+            gc.engine.fingerprints.Delete(key)
+            gc.engine.segmentStore.segments.Delete(segment.SegmentID)
+        }
+
+        return true
+    })
+}
+
+func generateRecipeID() string {
+    return fmt.Sprintf("recipe-%d", time.Now().UnixNano())
 }

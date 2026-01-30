@@ -737,3 +737,551 @@ func (ofs *OneFS) selectReplacementNode(failedNodeID int) int {
     }
     return 0
 }
+
+// ============================================================================
+// VPLEX Metro Clustering Implementation
+// ============================================================================
+
+// VPLEXMetroCluster provides active-active metro clustering with synchronous replication
+type VPLEXMetroCluster struct {
+    // Cluster sites
+    sites           map[string]*ClusterSite
+    sitesMu         sync.RWMutex
+
+    // Witness service for arbitration
+    witness         *WitnessService
+
+    // Distributed cache coherence
+    cacheCoherence  *DistributedCache
+
+    // Consistency groups
+    consistencyGroups map[string]*ConsistencyGroup
+    cgMu            sync.RWMutex
+
+    // Replication engine
+    replication     *MetroReplication
+
+    // Cluster configuration
+    config          *MetroClusterConfig
+}
+
+// ClusterSite represents a data center site in metro cluster
+type ClusterSite struct {
+    SiteID          string
+    Name            string
+    Location        string
+
+    // Storage arrays at this site
+    Arrays          []*StorageArray
+
+    // Site health
+    Healthy         bool
+    LastHeartbeat   time.Time
+
+    // Network connectivity
+    Latency         time.Duration
+    Bandwidth       int64
+
+    // Cache at this site
+    LocalCache      *SiteCache
+}
+
+// StorageArray represents a storage array at a site
+type StorageArray struct {
+    ArrayID         string
+    Type            string  // "PowerStore", "Unity", etc.
+    Capacity        int64
+    Used            int64
+
+    // Virtual volumes
+    VirtualVolumes  map[string]*VirtualVolume
+    vvMu            sync.RWMutex
+}
+
+// VirtualVolume represents a distributed volume across sites
+type VirtualVolume struct {
+    VolumeID        string
+    Name            string
+    Size            int64
+
+    // Distribution across sites
+    Extents         map[string]*VolumeExtent  // siteID -> extent
+
+    // Access mode
+    AccessMode      AccessMode
+
+    // Consistency group membership
+    ConsistencyGroupID string
+
+    // Replication state
+    ReplicationState ReplicationState
+}
+
+// VolumeExtent represents portion of volume at a site
+type VolumeExtent struct {
+    SiteID          string
+    ArrayID         string
+    LocalPath       string
+    Size            int64
+
+    // Mirror relationship
+    MirrorSiteID    string
+    InSync          bool
+    LastSyncTime    time.Time
+}
+
+type AccessMode int
+
+const (
+    AccessModeReadWrite AccessMode = iota
+    AccessModeReadOnly
+    AccessModeActiveActive
+)
+
+type ReplicationState int
+
+const (
+    ReplicationSynced ReplicationState = iota
+    ReplicationSyncing
+    ReplicationDegraded
+    ReplicationFailed
+)
+
+// ConsistencyGroup ensures crash-consistent replication
+type ConsistencyGroup struct {
+    GroupID         string
+    Name            string
+
+    // Volumes in this group
+    Volumes         []string  // Volume IDs
+
+    // Synchronization
+    SyncInterval    time.Duration
+    LastSync        time.Time
+
+    // Recovery point objective
+    RPO             time.Duration
+}
+
+// WitnessService provides arbitration for split-brain scenarios
+type WitnessService struct {
+    WitnessID       string
+    Location        string
+
+    // Site registrations
+    RegisteredSites map[string]*SiteRegistration
+    regMu           sync.RWMutex
+
+    // Quorum management
+    quorum          *QuorumManager
+}
+
+// SiteRegistration tracks site registration with witness
+type SiteRegistration struct {
+    SiteID          string
+    RegisteredAt    time.Time
+    LastHeartbeat   time.Time
+    Healthy         bool
+}
+
+// QuorumManager handles site quorum and failover decisions
+type QuorumManager struct {
+    mu              sync.RWMutex
+    votes           map[string]int  // siteID -> vote count
+    quorumThreshold int
+}
+
+// DistributedCache provides cache coherence across sites
+type DistributedCache struct {
+    // Local cache entries
+    entries         sync.Map  // key -> *CacheEntry
+
+    // Coherence protocol (write-through, write-back)
+    protocol        CacheProtocol
+
+    // Invalidation tracking
+    invalidations   chan *CacheInvalidation
+}
+
+type CacheProtocol int
+
+const (
+    CacheProtocolWriteThrough CacheProtocol = iota
+    CacheProtocolWriteBack
+)
+
+// CacheEntry represents a cached data block
+type CacheEntry struct {
+    Key             string
+    Data            []byte
+
+    // Ownership and coherence
+    OwnerSiteID     string
+    State           CacheState
+    Version         uint64
+
+    // Timing
+    CreatedAt       time.Time
+    LastAccessed    time.Time
+    Dirty           bool
+}
+
+type CacheState int
+
+const (
+    CacheStateInvalid CacheState = iota
+    CacheStateShared
+    CacheStateExclusive
+    CacheStateModified
+)
+
+// CacheInvalidation represents a cache invalidation message
+type CacheInvalidation struct {
+    Key             string
+    Version         uint64
+    SourceSiteID    string
+}
+
+// SiteCache provides local caching at a site
+type SiteCache struct {
+    entries         sync.Map
+    maxSize         int64
+    currentSize     int64
+    mu              sync.RWMutex
+}
+
+// MetroReplication handles synchronous replication between sites
+type MetroReplication struct {
+    // Replication channels
+    writeLog        *ReplicationLog
+
+    // Replication workers
+    workers         []*ReplicationWorker
+
+    // Synchronization
+    syncMode        SyncMode
+}
+
+type SyncMode int
+
+const (
+    SyncModeSynchronous SyncMode = iota
+    SyncModeAsynchronous
+)
+
+// ReplicationLog tracks writes for replication
+type ReplicationLog struct {
+    entries         []*ReplicationEntry
+    mu              sync.RWMutex
+    nextSequence    uint64
+}
+
+// ReplicationEntry represents a write to be replicated
+type ReplicationEntry struct {
+    SequenceNumber  uint64
+    VolumeID        string
+    Offset          int64
+    Data            []byte
+    Timestamp       time.Time
+
+    // Acknowledgements from sites
+    Acks            map[string]bool  // siteID -> acked
+    ackMu           sync.RWMutex
+}
+
+// ReplicationWorker replicates data to remote sites
+type ReplicationWorker struct {
+    WorkerID        int
+    SourceSite      string
+    TargetSite      string
+
+    // Work queue
+    queue           chan *ReplicationEntry
+
+    // Statistics
+    BytesReplicated int64
+    Latency         time.Duration
+}
+
+// MetroClusterConfig holds metro cluster configuration
+type MetroClusterConfig struct {
+    ClusterName     string
+    MaxLatency      time.Duration  // Maximum tolerable latency between sites
+    SyncTimeout     time.Duration
+
+    // Failover settings
+    AutoFailover    bool
+    FailoverTimeout time.Duration
+
+    // Witness configuration
+    WitnessEnabled  bool
+    WitnessURL      string
+}
+
+// NewVPLEXMetroCluster creates a new metro cluster
+func NewVPLEXMetroCluster(config *MetroClusterConfig) *VPLEXMetroCluster {
+    cluster := &VPLEXMetroCluster{
+        sites:             make(map[string]*ClusterSite),
+        consistencyGroups: make(map[string]*ConsistencyGroup),
+        config:            config,
+    }
+
+    // Initialize witness service
+    if config.WitnessEnabled {
+        cluster.witness = &WitnessService{
+            WitnessID:       "witness-1",
+            Location:        config.WitnessURL,
+            RegisteredSites: make(map[string]*SiteRegistration),
+            quorum:          &QuorumManager{
+                votes:           make(map[string]int),
+                quorumThreshold: 2,
+            },
+        }
+    }
+
+    // Initialize distributed cache
+    cluster.cacheCoherence = &DistributedCache{
+        protocol:      CacheProtocolWriteThrough,
+        invalidations: make(chan *CacheInvalidation, 1000),
+    }
+
+    // Initialize replication engine
+    cluster.replication = &MetroReplication{
+        writeLog: &ReplicationLog{
+            entries: make([]*ReplicationEntry, 0),
+        },
+        syncMode: SyncModeSynchronous,
+    }
+
+    // Start cache coherence handler
+    go cluster.handleCacheInvalidations()
+
+    return cluster
+}
+
+// AddSite adds a new site to the metro cluster
+func (vmc *VPLEXMetroCluster) AddSite(site *ClusterSite) error {
+    vmc.sitesMu.Lock()
+    defer vmc.sitesMu.Unlock()
+
+    if _, exists := vmc.sites[site.SiteID]; exists {
+        return fmt.Errorf("site already exists: %s", site.SiteID)
+    }
+
+    vmc.sites[site.SiteID] = site
+
+    // Register with witness
+    if vmc.witness != nil {
+        vmc.witness.RegisterSite(site.SiteID)
+    }
+
+    return nil
+}
+
+// CreateVirtualVolume creates a distributed virtual volume
+func (vmc *VPLEXMetroCluster) CreateVirtualVolume(name string, size int64,
+                                                  primarySite, secondarySite string) (*VirtualVolume, error) {
+
+    vv := &VirtualVolume{
+        VolumeID:         generateVolumeID(),
+        Name:             name,
+        Size:             size,
+        Extents:          make(map[string]*VolumeExtent),
+        AccessMode:       AccessModeActiveActive,
+        ReplicationState: ReplicationSynced,
+    }
+
+    // Create extent on primary site
+    primaryExtent := &VolumeExtent{
+        SiteID:       primarySite,
+        LocalPath:    fmt.Sprintf("/vplex/%s/primary", vv.VolumeID),
+        Size:         size,
+        MirrorSiteID: secondarySite,
+        InSync:       true,
+        LastSyncTime: time.Now(),
+    }
+    vv.Extents[primarySite] = primaryExtent
+
+    // Create extent on secondary site
+    secondaryExtent := &VolumeExtent{
+        SiteID:       secondarySite,
+        LocalPath:    fmt.Sprintf("/vplex/%s/secondary", vv.VolumeID),
+        Size:         size,
+        MirrorSiteID: primarySite,
+        InSync:       true,
+        LastSyncTime: time.Now(),
+    }
+    vv.Extents[secondarySite] = secondaryExtent
+
+    return vv, nil
+}
+
+// WriteToVolume performs synchronous write to distributed volume
+func (vmc *VPLEXMetroCluster) WriteToVolume(ctx context.Context, volumeID string,
+                                           offset int64, data []byte) error {
+
+    // Create replication entry
+    entry := &ReplicationEntry{
+        SequenceNumber: vmc.replication.writeLog.GetNextSequence(),
+        VolumeID:       volumeID,
+        Offset:         offset,
+        Data:           data,
+        Timestamp:      time.Now(),
+        Acks:           make(map[string]bool),
+    }
+
+    // Write to all sites synchronously
+    vmc.sitesMu.RLock()
+    sites := make([]*ClusterSite, 0, len(vmc.sites))
+    for _, site := range vmc.sites {
+        if site.Healthy {
+            sites = append(sites, site)
+        }
+    }
+    vmc.sitesMu.RUnlock()
+
+    // Parallel write to all sites
+    var wg sync.WaitGroup
+    errChan := make(chan error, len(sites))
+
+    for _, site := range sites {
+        wg.Add(1)
+        go func(s *ClusterSite) {
+            defer wg.Done()
+
+            // Write to site (simulated)
+            if err := vmc.writeToSite(ctx, s.SiteID, volumeID, offset, data); err != nil {
+                errChan <- err
+                return
+            }
+
+            // Mark as acknowledged
+            entry.ackMu.Lock()
+            entry.Acks[s.SiteID] = true
+            entry.ackMu.Unlock()
+
+        }(site)
+    }
+
+    // Wait for all writes with timeout
+    done := make(chan struct{})
+    go func() {
+        wg.Wait()
+        close(done)
+    }()
+
+    select {
+    case <-done:
+        // All writes completed
+    case <-time.After(vmc.config.SyncTimeout):
+        return fmt.Errorf("synchronous write timeout")
+    case err := <-errChan:
+        return fmt.Errorf("write failed: %w", err)
+    }
+
+    // Invalidate cache across all sites
+    vmc.cacheCoherence.invalidations <- &CacheInvalidation{
+        Key:     fmt.Sprintf("%s:%d", volumeID, offset),
+        Version: entry.SequenceNumber,
+    }
+
+    return nil
+}
+
+// writeToSite writes data to a specific site
+func (vmc *VPLEXMetroCluster) writeToSite(ctx context.Context, siteID, volumeID string,
+                                         offset int64, data []byte) error {
+    // Simulate RPC to site
+    // In production, this would use gRPC or similar
+    return nil
+}
+
+// handleCacheInvalidations processes cache invalidation messages
+func (vmc *VPLEXMetroCluster) handleCacheInvalidations() {
+    for invalidation := range vmc.cacheCoherence.invalidations {
+        // Invalidate cache entry across all sites
+        vmc.cacheCoherence.entries.Delete(invalidation.Key)
+    }
+}
+
+// PerformFailover performs site failover
+func (vmc *VPLEXMetroCluster) PerformFailover(failedSite, targetSite string) error {
+    vmc.sitesMu.Lock()
+    defer vmc.sitesMu.Unlock()
+
+    failed, exists := vmc.sites[failedSite]
+    if !exists {
+        return fmt.Errorf("site not found: %s", failedSite)
+    }
+
+    target, exists := vmc.sites[targetSite]
+    if !exists {
+        return fmt.Errorf("target site not found: %s", targetSite)
+    }
+
+    // Mark failed site as unhealthy
+    failed.Healthy = false
+
+    // Check quorum with witness
+    if vmc.witness != nil {
+        hasQuorum := vmc.witness.CheckQuorum(targetSite)
+        if !hasQuorum {
+            return fmt.Errorf("insufficient quorum for failover")
+        }
+    }
+
+    // Promote target site volumes
+    for _, array := range target.Arrays {
+        array.vvMu.Lock()
+        for _, vv := range array.VirtualVolumes {
+            if vv.ReplicationState == ReplicationSynced {
+                vv.AccessMode = AccessModeReadWrite
+            }
+        }
+        array.vvMu.Unlock()
+    }
+
+    return nil
+}
+
+// RegisterSite registers a site with the witness
+func (ws *WitnessService) RegisterSite(siteID string) {
+    ws.regMu.Lock()
+    defer ws.regMu.Unlock()
+
+    ws.RegisteredSites[siteID] = &SiteRegistration{
+        SiteID:       siteID,
+        RegisteredAt: time.Now(),
+        LastHeartbeat: time.Now(),
+        Healthy:      true,
+    }
+}
+
+// CheckQuorum checks if a site has quorum
+func (ws *WitnessService) CheckQuorum(siteID string) bool {
+    ws.regMu.RLock()
+    defer ws.regMu.RUnlock()
+
+    healthySites := 0
+    for _, reg := range ws.RegisteredSites {
+        if reg.Healthy {
+            healthySites++
+        }
+    }
+
+    return healthySites >= ws.quorum.quorumThreshold
+}
+
+// GetNextSequence returns next sequence number for replication
+func (rl *ReplicationLog) GetNextSequence() uint64 {
+    rl.mu.Lock()
+    defer rl.mu.Unlock()
+
+    seq := rl.nextSequence
+    rl.nextSequence++
+    return seq
+}
+
+func generateVolumeID() string {
+    return fmt.Sprintf("vol-%d", time.Now().UnixNano())
+}
