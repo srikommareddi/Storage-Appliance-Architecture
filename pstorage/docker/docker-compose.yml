@@ -1,0 +1,78 @@
+# PStorage Cluster Deployment
+# This creates a 2-node ActiveCluster for high availability
+
+version: '3.8'
+
+services:
+  # Primary node
+  pstorage-node1:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: pstorage-node1
+    hostname: pstorage-node1
+    environment:
+      - PSTORAGE_NODE_ID=node-1
+      - PSTORAGE_API_HOST=0.0.0.0
+      - PSTORAGE_API_PORT=8000
+      - PSTORAGE_CLUSTER_ENABLED=true
+      - PSTORAGE_REPLICATION_MODE=sync
+      - PSTORAGE_PEER_NODES=["http://pstorage-node2:8000"]
+      - PSTORAGE_DATA_DIR=/data/pstorage
+      - PSTORAGE_METADATA_DIR=/metadata/pstorage
+    ports:
+      - "8001:8000"
+    volumes:
+      - node1-data:/data/pstorage
+      - node1-metadata:/metadata/pstorage
+    networks:
+      - pstorage-cluster
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # Secondary node
+  pstorage-node2:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: pstorage-node2
+    hostname: pstorage-node2
+    environment:
+      - PSTORAGE_NODE_ID=node-2
+      - PSTORAGE_API_HOST=0.0.0.0
+      - PSTORAGE_API_PORT=8000
+      - PSTORAGE_CLUSTER_ENABLED=true
+      - PSTORAGE_REPLICATION_MODE=sync
+      - PSTORAGE_PEER_NODES=["http://pstorage-node1:8000"]
+      - PSTORAGE_DATA_DIR=/data/pstorage
+      - PSTORAGE_METADATA_DIR=/metadata/pstorage
+    ports:
+      - "8002:8000"
+    volumes:
+      - node2-data:/data/pstorage
+      - node2-metadata:/metadata/pstorage
+    networks:
+      - pstorage-cluster
+    depends_on:
+      pstorage-node1:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  node1-data:
+  node1-metadata:
+  node2-data:
+  node2-metadata:
+
+networks:
+  pstorage-cluster:
+    driver: bridge
