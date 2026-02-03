@@ -24,13 +24,27 @@ type NVMeoFInitiator struct {
 
 	// I/O queues
 	ioQueues     []*IOQueue
+	ioQueuesMu   sync.RWMutex
 
 	// Admin queue
 	adminQueue   *AdminQueue
 
+	// Queue configuration
+	ioQueueCount  int
+	ioQueueSize   uint16
+	adminQueueSize uint16
+	queueCursor   uint32
+
 	// Running state
 	running      bool
 	runningMu    sync.Mutex
+}
+
+// InitiatorConfig controls queue sizing and counts.
+type InitiatorConfig struct {
+	IOQueueCount  int
+	IOQueueSize   uint16
+	AdminQueueSize uint16
 }
 
 type ConnectedSubsystem struct {
@@ -236,6 +250,24 @@ const (
 )
 
 func NewNVMeoFInitiator(targetAddr string, hostNQN string) (*NVMeoFInitiator, error) {
+	return NewNVMeoFInitiatorWithConfig(targetAddr, hostNQN, InitiatorConfig{
+		IOQueueCount:  4,
+		IOQueueSize:   128,
+		AdminQueueSize: 32,
+	})
+}
+
+func NewNVMeoFInitiatorWithConfig(targetAddr string, hostNQN string, cfg InitiatorConfig) (*NVMeoFInitiator, error) {
+	if cfg.IOQueueCount <= 0 {
+		cfg.IOQueueCount = 1
+	}
+	if cfg.IOQueueSize == 0 {
+		cfg.IOQueueSize = 128
+	}
+	if cfg.AdminQueueSize == 0 {
+		cfg.AdminQueueSize = 32
+	}
+
 	// Connect to target via TCP
 	conn, err := net.DialTimeout("tcp", targetAddr, 5*time.Second)
 	if err != nil {
@@ -246,13 +278,16 @@ func NewNVMeoFInitiator(targetAddr string, hostNQN string) (*NVMeoFInitiator, er
 		conn:       conn,
 		hostNQN:    hostNQN,
 		subsystems: make(map[string]*ConnectedSubsystem),
+		ioQueueCount:  cfg.IOQueueCount,
+		ioQueueSize:   cfg.IOQueueSize,
+		adminQueueSize: cfg.AdminQueueSize,
 		running:    true,
 	}
 
 	// Create admin queue
 	initiator.adminQueue = &AdminQueue{
 		QID:     0,
-		Size:    32,
+		Size:    cfg.AdminQueueSize,
 		pending: make(map[uint16]*PendingCommand),
 	}
 
@@ -403,7 +438,7 @@ func (ni *NVMeoFInitiator) identifyNamespace(ctx context.Context,
 func (ni *NVMeoFInitiator) createIOQueues(ctx context.Context,
 	subsys *ConnectedSubsystem) error {
 
-	numQueues := 4  // Create 4 I/O queues
+	numQueues := ni.ioQueueCount
 
 	for i := 0; i < numQueues; i++ {
 		qid := uint16(i + 1)
@@ -415,7 +450,7 @@ func (ni *NVMeoFInitiator) createIOQueues(ctx context.Context,
 
 		cmd.Fabrics.FCType = NVMeFabricsTypeConnect
 		cmd.Fabrics.QID = qid
-		cmd.Fabrics.SQSize = 128  // Queue size
+		cmd.Fabrics.SQSize = ni.ioQueueSize  // Queue size
 
 		connectData := ConnectData{
 			HostNQN:   ni.hostNQN,
@@ -434,14 +469,34 @@ func (ni *NVMeoFInitiator) createIOQueues(ctx context.Context,
 		// Create queue object
 		queue := &IOQueue{
 			QID:     qid,
-			Size:    128,
+			Size:    ni.ioQueueSize,
 			pending: make(map[uint16]*PendingCommand),
 		}
 
+		ni.ioQueuesMu.Lock()
 		ni.ioQueues = append(ni.ioQueues, queue)
+		ni.ioQueuesMu.Unlock()
 	}
 
 	return nil
+}
+
+// QueueCount returns the number of I/O queues.
+func (ni *NVMeoFInitiator) QueueCount() int {
+	ni.ioQueuesMu.RLock()
+	defer ni.ioQueuesMu.RUnlock()
+	return len(ni.ioQueues)
+}
+
+func (ni *NVMeoFInitiator) pickQueue() (*IOQueue, error) {
+	ni.ioQueuesMu.RLock()
+	defer ni.ioQueuesMu.RUnlock()
+
+	if len(ni.ioQueues) == 0 {
+		return nil, fmt.Errorf("no I/O queues available")
+	}
+	index := int(atomic.AddUint32(&ni.queueCursor, 1)-1) % len(ni.ioQueues)
+	return ni.ioQueues[index], nil
 }
 
 // Read from namespace
@@ -467,11 +522,10 @@ func (ni *NVMeoFInitiator) Read(ctx context.Context, nqn string, nsid uint32,
 		return fmt.Errorf("buffer too small")
 	}
 
-	// Select I/O queue (round-robin)
-	if len(ni.ioQueues) == 0 {
-		return fmt.Errorf("no I/O queues available")
+	queue, err := ni.pickQueue()
+	if err != nil {
+		return err
 	}
-	queue := ni.ioQueues[0]
 
 	// Build read command
 	cmd := NVMeCommand{
@@ -485,6 +539,60 @@ func (ni *NVMeoFInitiator) Read(ctx context.Context, nqn string, nsid uint32,
 	// Submit command
 	done := make(chan error, 1)
 
+	queue.SubmitCommand(ni.conn, &cmd, buffer, func(status uint16, result uint64) {
+		if status != NVMeStatusSuccess {
+			done <- fmt.Errorf("read failed: 0x%x", status)
+		} else {
+			done <- nil
+		}
+	})
+
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// ReadWithQueue reads using a specific I/O queue index.
+func (ni *NVMeoFInitiator) ReadWithQueue(ctx context.Context, nqn string, nsid uint32,
+	lba uint64, numBlocks uint32, buffer []byte, queueIndex int) error {
+
+	ni.subsystemsMu.RLock()
+	subsys, exists := ni.subsystems[nqn]
+	ni.subsystemsMu.RUnlock()
+
+	if !exists {
+		return fmt.Errorf("subsystem not connected")
+	}
+
+	ns, exists := subsys.Namespaces[nsid]
+	if !exists {
+		return fmt.Errorf("namespace not found")
+	}
+
+	if uint64(len(buffer)) < uint64(numBlocks)*uint64(ns.BlockSize) {
+		return fmt.Errorf("buffer too small")
+	}
+
+	ni.ioQueuesMu.RLock()
+	defer ni.ioQueuesMu.RUnlock()
+
+	if queueIndex < 0 || queueIndex >= len(ni.ioQueues) {
+		return fmt.Errorf("invalid queue index")
+	}
+	queue := ni.ioQueues[queueIndex]
+
+	cmd := NVMeCommand{
+		Opcode: NVMeCmdRead,
+		NSID:   nsid,
+	}
+
+	cmd.RW.SLBA = lba
+	cmd.RW.Length = uint16(numBlocks - 1)
+
+	done := make(chan error, 1)
 	queue.SubmitCommand(ni.conn, &cmd, buffer, func(status uint16, result uint64) {
 		if status != NVMeStatusSuccess {
 			done <- fmt.Errorf("read failed: 0x%x", status)
@@ -524,10 +632,10 @@ func (ni *NVMeoFInitiator) Write(ctx context.Context, nqn string, nsid uint32,
 		return fmt.Errorf("buffer too small")
 	}
 
-	if len(ni.ioQueues) == 0 {
-		return fmt.Errorf("no I/O queues available")
+	queue, err := ni.pickQueue()
+	if err != nil {
+		return err
 	}
-	queue := ni.ioQueues[0]
 
 	cmd := NVMeCommand{
 		Opcode: NVMeCmdWrite,
@@ -555,12 +663,99 @@ func (ni *NVMeoFInitiator) Write(ctx context.Context, nqn string, nsid uint32,
 	}
 }
 
+// WriteWithQueue writes using a specific I/O queue index.
+func (ni *NVMeoFInitiator) WriteWithQueue(ctx context.Context, nqn string, nsid uint32,
+	lba uint64, numBlocks uint32, buffer []byte, queueIndex int) error {
+
+	ni.subsystemsMu.RLock()
+	subsys, exists := ni.subsystems[nqn]
+	ni.subsystemsMu.RUnlock()
+
+	if !exists {
+		return fmt.Errorf("subsystem not connected")
+	}
+
+	ns, exists := subsys.Namespaces[nsid]
+	if !exists {
+		return fmt.Errorf("namespace not found")
+	}
+
+	if uint64(len(buffer)) < uint64(numBlocks)*uint64(ns.BlockSize) {
+		return fmt.Errorf("buffer too small")
+	}
+
+	ni.ioQueuesMu.RLock()
+	defer ni.ioQueuesMu.RUnlock()
+
+	if queueIndex < 0 || queueIndex >= len(ni.ioQueues) {
+		return fmt.Errorf("invalid queue index")
+	}
+	queue := ni.ioQueues[queueIndex]
+
+	cmd := NVMeCommand{
+		Opcode: NVMeCmdWrite,
+		NSID:   nsid,
+	}
+
+	cmd.RW.SLBA = lba
+	cmd.RW.Length = uint16(numBlocks - 1)
+
+	done := make(chan error, 1)
+	queue.SubmitCommand(ni.conn, &cmd, buffer, func(status uint16, result uint64) {
+		if status != NVMeStatusSuccess {
+			done <- fmt.Errorf("write failed: 0x%x", status)
+		} else {
+			done <- nil
+		}
+	})
+
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // Flush namespace
 func (ni *NVMeoFInitiator) Flush(ctx context.Context, nqn string, nsid uint32) error {
-	if len(ni.ioQueues) == 0 {
-		return fmt.Errorf("no I/O queues available")
+	queue, err := ni.pickQueue()
+	if err != nil {
+		return err
 	}
-	queue := ni.ioQueues[0]
+
+	cmd := NVMeCommand{
+		Opcode: NVMeCmdFlush,
+		NSID:   nsid,
+	}
+
+	done := make(chan error, 1)
+
+	queue.SubmitCommand(ni.conn, &cmd, nil, func(status uint16, result uint64) {
+		if status != NVMeStatusSuccess {
+			done <- fmt.Errorf("flush failed: 0x%x", status)
+		} else {
+			done <- nil
+		}
+	})
+
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// FlushWithQueue flushes using a specific I/O queue index.
+func (ni *NVMeoFInitiator) FlushWithQueue(ctx context.Context, nqn string, nsid uint32, queueIndex int) error {
+	ni.ioQueuesMu.RLock()
+	defer ni.ioQueuesMu.RUnlock()
+
+	if queueIndex < 0 || queueIndex >= len(ni.ioQueues) {
+		return fmt.Errorf("invalid queue index")
+	}
+	queue := ni.ioQueues[queueIndex]
 
 	cmd := NVMeCommand{
 		Opcode: NVMeCmdFlush,
@@ -647,6 +842,8 @@ func (ni *NVMeoFInitiator) dispatchCompletion(completion *NVMeCompletion) {
 		ni.adminQueue.HandleCompletion(completion)
 	} else {
 		// I/O queue completion
+		ni.ioQueuesMu.RLock()
+		defer ni.ioQueuesMu.RUnlock()
 		for _, queue := range ni.ioQueues {
 			if queue.QID == completion.SQID {
 				queue.HandleCompletion(completion)

@@ -41,7 +41,7 @@ This project implements core technologies from Dell's storage portfolio:
 - ✅ Multi-platform Docker builds
 - ✅ SPDK integration for hardware acceleration
 
-**For detailed job alignment analysis, see**: [Dell Job Alignment](docs/DELL_JOB_ALIGNMENT.md)
+**For detailed job alignment analysis, see**: [Storage systems](docs/Storage%20systems.md)
 
 ---
 
@@ -146,6 +146,156 @@ This project implements core technologies from Dell's storage portfolio:
 - Container persistent volumes
 - Database storage
 - High-performance computing
+
+---
+
+### **NVMe Driver Package** - PCIe + Fabrics Drivers
+**Location:** `nvmedrv/`
+
+**Features:**
+- C-backed PCIe NVMe driver wrapper (CGO required)
+- C-backed NVMe-oF driver wrapper (emulated TCP today; RoCE/FC hooks)
+- Optional SPDK-backed NVMe/NVMe-oF (TCP/RDMA) with build tag `spdk`
+- Multi-queue scheduling with queue depth controls
+- MSI-X and NUMA policy configuration hooks
+- C emulated backend for development/testing
+
+**Use Cases:**
+- PowerStore/PowerMax style NVMe device integration
+- Driver experimentation across PCIe and fabrics
+
+**Basic Usage (PCIe):**
+```go
+import (
+    "time"
+
+    "github.com/srilakshmi/storage/nvmedrv"
+)
+
+cfg := nvmedrv.ControllerConfig{
+    Transport:  nvmedrv.TransportPCIe,
+    PCIAddress: "0000:3b:00.0",
+    NamespaceID: 1,
+    Queue: nvmedrv.QueueConfig{
+        IOQueues:      8,
+        IOQueueDepth:  256,
+        AdminQueueDepth: 64,
+    },
+    AllowSoftwareFallback: true,
+}
+
+ctrl, _ := nvmedrv.NewController(cfg)
+defer ctrl.Close()
+buf := make([]byte, 4096)
+_ = ctrl.Read(0, 1, buf)
+```
+
+**Basic Usage (NVMe-oF TCP):**
+```go
+import (
+    "time"
+
+    "github.com/srilakshmi/storage/nvmedrv"
+)
+
+cfg := nvmedrv.ControllerConfig{
+    Transport:    nvmedrv.TransportTCP,
+    Address:      "10.0.0.12:4420",
+    HostNQN:      "nqn.host",
+    SubsystemNQN: "nqn.storage",
+    NamespaceID:  1,
+    Queue: nvmedrv.QueueConfig{
+        IOQueues:      4,
+        IOQueueDepth:  128,
+        AdminQueueDepth: 32,
+    },
+    Timeout: 30 * time.Second,
+}
+
+ctrl, _ := nvmedrv.NewController(cfg)
+defer ctrl.Close()
+buf := make([]byte, 4096)
+_ = ctrl.Write(0, 1, buf)
+```
+
+**Basic Usage (DPU NVMe-oF Offload):**
+```go
+import (
+    "context"
+    "time"
+
+    "github.com/srilakshmi/storage/dpu"
+)
+
+client := dpu.NewClient("dpu://local")
+ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+defer cancel()
+
+target, _ := client.OffloadNVMeTarget(ctx, dpu.NVMeTargetConfig{
+    SubsystemNQN: "nqn.storage",
+    ListenAddr:  "0.0.0.0:4420",
+    HostNQN:     "nqn.host",
+    NamespaceID: 1,
+    SizeBytes:   1024 * 1024 * 1024,
+    BlockSize:   4096,
+})
+
+_ = target.Running()
+```
+
+**Basic Usage (PowerScale DPU Offload):**
+```go
+import (
+    "time"
+
+    "github.com/srilakshmi/storage/powerscale"
+)
+
+ofs := powerscale.NewOneFS(nodes, 4, 2)
+ofs.EnableDPUOffload(powerscale.DPUOffloadConfig{
+    SimulatedLatency: 200 * time.Microsecond,
+    MaxConcurrency:   8,
+})
+```
+
+**End-to-End (DPU + PowerScale + NVMe-oF):**
+```go
+import (
+    "context"
+    "time"
+
+    "github.com/srilakshmi/storage/dpu"
+    "github.com/srilakshmi/storage/nvmeof"
+    "github.com/srilakshmi/storage/powerscale"
+)
+
+// 1) Spin up NVMe-oF target
+target := nvmeof.NewNVMeoFTarget("nqn.target", "0.0.0.0:4420")
+subsys, _ := target.CreateSubsystem("nqn.storage", "SN12345", "Model-X")
+subsys.AddNamespace(1, 1024*1024*1024*1024, 4096)
+subsys.AllowHost("nqn.host")
+_ = target.Start()
+
+// 2) Register DPU NVMe-oF offload
+client := dpu.NewClient("dpu://local")
+ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+defer cancel()
+client.OffloadNVMeTarget(ctx, dpu.NVMeTargetConfig{
+    SubsystemNQN: "nqn.storage",
+    ListenAddr:  "0.0.0.0:4420",
+    HostNQN:     "nqn.host",
+    NamespaceID: 1,
+    SizeBytes:   1024 * 1024 * 1024,
+    BlockSize:   4096,
+})
+
+// 3) Enable PowerScale DPU erasure offload
+ofs := powerscale.NewOneFS(nodes, 4, 2)
+ofs.EnableDPUOffload(powerscale.DPUOffloadConfig{
+    SimulatedLatency: 200 * time.Microsecond,
+    MaxConcurrency:   8,
+})
+```
 
 ---
 
@@ -346,6 +496,39 @@ CGO_ENABLED=1 go build -tags cgo ./...
 
 ---
 
+### SPDK Mode (NVMe/NVMe-oF via C, Optional)
+
+**Prerequisites:**
+```bash
+# Install SPDK and pkg-config metadata
+git clone https://github.com/spdk/spdk
+cd spdk
+./scripts/pkgdep.sh
+./configure
+make
+
+# Ensure pkg-config can find SPDK (adjust path as needed)
+export PKG_CONFIG_PATH=/path/to/spdk/build/lib/pkgconfig
+```
+
+**Build:**
+```bash
+CGO_ENABLED=1 go build -tags spdk ./...
+```
+
+**Features:**
+- ✅ PCIe NVMe with SPDK poll-mode drivers
+- ✅ NVMe-oF TCP/RDMA initiator support
+- ✅ Queueing + completion via SPDK
+- ❌ Linux only
+
+**Use Cases:**
+- Wire-level NVMe-oF testing
+- Low-latency NVMe/NVMe-oF performance validation
+- DPU offload prototypes
+
+---
+
 ## 📊 Feature Comparison
 
 | Feature | Unity | PowerScale | NVMe-oF | CGO Bridge |
@@ -460,6 +643,18 @@ Storage-Appliance-Architecture/
 │   ├── initiator.go           # 816 lines (client)
 │   └── target.go              # 690 lines (server)
 │
+├── nvmedrv/                    # NVMe driver (PCIe + fabrics)
+│   ├── config.go              # Driver interfaces/config
+│   ├── defaults.go            # Default sizes
+│   ├── driver.h               # C driver interfaces
+│   ├── driver_cgo.go          # C emulation + protocol logic
+│   ├── fabrics_cgo.go         # NVMe-oF wrapper (CGO)
+│   ├── fabrics_nocgo.go       # NVMe-oF stub (no CGO)
+│   ├── pcie_cgo.go            # PCIe wrapper (CGO)
+│   ├── pcie_nocgo.go          # PCIe stub (no CGO)
+│   ├── queues.go              # Queue scheduling helpers
+│   └── spdk_cgo.go            # SPDK-backed path (tag: spdk)
+│
 ├── cgo-bridge/                 # Hardware Acceleration
 │   ├── nvme_hardware.go       # 162 lines (CGO mode)
 │   ├── nvme_software.go       # 45 lines (fallback)
@@ -553,7 +748,7 @@ See LICENSE file for details.
 
 ```
 Total Lines of Code:    5,053 (Go) + 2,069 (C++)
-Packages:               5 (unity, powerscale, nvmeof, cgo-bridge, main)
+Packages:               6 (unity, powerscale, nvmeof, nvmedrv, cgo-bridge, main)
 Features:               100+
 Supported Protocols:    S3, NVMe-oF, POSIX
 Performance:            Up to 1M+ IOPS (CGO mode), 100K IOPS (Pure Go)
@@ -582,6 +777,11 @@ Storage-Appliance-Architecture/
 ├── nvmeof/                # NVMe over Fabrics
 │   ├── initiator.go      # 816 lines (client)
 │   └── target.go         # 690 lines (server)
+├── nvmedrv/               # NVMe driver (PCIe + fabrics)
+│   ├── config.go         # Driver interfaces/config
+│   ├── fabrics.go        # NVMe-oF wrapper
+│   ├── pcie.go           # PCIe wrapper + emulated backend
+│   └── queues.go         # Queue scheduling helpers
 ├── cgo-bridge/            # Hardware Acceleration
 │   ├── nvme_hardware.go  # 162 lines (CGO mode)
 │   ├── nvme_software.go  # 45 lines (fallback)

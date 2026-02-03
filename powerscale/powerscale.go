@@ -10,6 +10,7 @@ import (
     "time"
 
     "github.com/klauspost/reedsolomon"
+	"github.com/srilakshmi/storage/dpu"
 )
 
 // OneFS-inspired distributed filesystem
@@ -36,6 +37,15 @@ type OneFS struct {
     
     // Global namespace
     namespace       *DistributedNamespace
+
+	// Optional DPU erasure coding offload
+	dpuEncoder      DPUEncoder
+
+	// Optional DPU client for offload orchestration
+	dpuClient       *dpu.Client
+
+	// Guards DPU encoder/client updates
+	dpuMu           sync.RWMutex
 }
 
 type Node struct {
@@ -307,6 +317,13 @@ func (ofs *OneFS) ReadFile(ctx context.Context, path string,
 
 // Stripe encoding with Reed-Solomon
 func (ofs *OneFS) encodeStripe(data []byte, protection ProtectionLevel) ([][]byte, error) {
+	ofs.dpuMu.RLock()
+	encoder := ofs.dpuEncoder
+	ofs.dpuMu.RUnlock()
+	if encoder != nil {
+		return encoder.Encode(data, protection)
+	}
+
     totalShards := protection.DataStripes + protection.ParityStripes
     
     // Create Reed-Solomon encoder

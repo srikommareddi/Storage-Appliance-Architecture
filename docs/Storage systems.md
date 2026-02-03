@@ -1,14 +1,4 @@
-# Dell Senior Principal Engineer - Job Alignment Analysis
 
-## Position: Software Senior Principal Engineer - Distributed Systems
-**Location**: Santa Clara, CA
-**Company**: Dell Technologies
-
----
-
-## Job Requirements vs. Project Capabilities
-
-### Required Qualifications
 
 #### 1. "Experience with distributed systems, storage systems, or related areas"
 

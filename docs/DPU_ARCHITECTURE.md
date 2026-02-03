@@ -81,19 +81,19 @@ This document outlines how the Storage Appliance Architecture could be enhanced 
 
 ### Phase 1: DPU Communication Layer
 ```go
-// pkg/dpu/client.go
+// dpu/client.go
 type DPUClient struct {
-    conn     *grpc.ClientConn
-    dpuAddr  string
-    metrics  *DPUMetrics
+    addr       string
+    metrics    *DPUMetrics
 }
 
-func NewDPUClient(dpuAddr string) (*DPUClient, error) {
-    // Connect to DPU gRPC service
+func NewDPUClient(addr string) *DPUClient {
+    // Local DPU client (placeholder for gRPC/DOCA)
 }
 
-func (c *DPUClient) OffloadNVMeTarget(config *NVMeTargetConfig) error {
-    // Deploy NVMe-oF target to DPU
+func (c *DPUClient) OffloadNVMeTarget(ctx context.Context,
+    config NVMeTargetConfig) (*DPUNVMeoFTarget, error) {
+    // Register NVMe-oF target on DPU
 }
 ```
 
@@ -109,6 +109,31 @@ func (t *DPUNVMeoFTarget) Start() error {
     // Start NVMe-oF target on DPU
     return t.dpuClient.OffloadNVMeTarget(t.config)
 }
+```
+
+### Example Usage
+```go
+import (
+    "context"
+    "time"
+
+    "github.com/srilakshmi/storage/dpu"
+)
+
+client := dpu.NewClient("dpu://local")
+ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+defer cancel()
+
+target, _ := client.OffloadNVMeTarget(ctx, dpu.NVMeTargetConfig{
+    SubsystemNQN: "nqn.storage",
+    ListenAddr:  "0.0.0.0:4420",
+    HostNQN:     "nqn.host",
+    NamespaceID: 1,
+    SizeBytes:   1024 * 1024 * 1024,
+    BlockSize:   4096,
+})
+
+_ = target.Running()
 ```
 
 ### Phase 3: Erasure Coding Offload
@@ -132,6 +157,20 @@ func (ofs *OneFS) encodeStripeDPU(data []byte,
 | IOPS | 100K | 5M+ | 50x higher |
 | CPU Usage | 100% | 10% | 90% reduction |
 | Network BW | Limited | 200 Gbps | DPU RDMA |
+
+## Driver Performance Targets (GPU + DPU)
+
+### GPU Offload Targets (Erasure + Compression)
+- **Reed-Solomon Encode**: 10-20 GB/s per GPU (A100/H100 class)
+- **Reed-Solomon Decode**: 8-16 GB/s per GPU
+- **Compression (zstd/lz4)**: 4-8 GB/s with GPU pipelines
+- **Use Cases**: Large object ingest, rebuild storms, bulk rebalancing
+
+### DPU NVMe/NVMe-oF Driver Targets
+- **NVMe-oF TCP**: 1-2M IOPS per DPU with SPDK poll-mode
+- **NVMe-oF RDMA**: 3-5M IOPS per DPU (RoCEv2)
+- **P99 Latency**: <5 μs on local NVMe, <10 μs over fabric
+- **CPU Savings**: 70-90% host CPU offload for I/O path
 
 ## DPU Vendor Support
 
@@ -163,10 +202,10 @@ The current architecture is **DPU-ready** with minimal modifications:
 3. **Performance Focus**: ✅ Already optimized for low latency
 
 ### Estimated Implementation Effort
-- **DPU Client Library**: 2-3 weeks
-- **NVMe-oF Offload**: 1-2 weeks
-- **Erasure Coding Offload**: 1 week
-- **Testing & Integration**: 2 weeks
+- **DPU Client Library**: implemented (local client placeholder)
+- **NVMe-oF Offload**: planned (1-2 weeks)
+- **Erasure Coding Offload**: implemented (local DPU emulator + worker pool)
+- **Testing & Integration**: pending
 - **Total**: ~2 months for full DPU integration
 
 ## Real-World Use Cases
