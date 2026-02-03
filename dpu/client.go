@@ -190,6 +190,8 @@ func (c *Client) Metrics() Metrics {
 
 // SetConnectLatency controls simulated connect time.
 func (c *Client) SetConnectLatency(latency time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.connectLag = latency
 }
 

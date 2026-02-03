@@ -400,50 +400,53 @@ func (ofs *OneFS) writeStripeToNodes(ctx context.Context, shards [][]byte,
     
     block := &BlockDescriptor{
         BlockNumber:  stripeNum,
-        DataShards:   make([]int, 0),
-        ParityShards: make([]int, 0),
+        DataShards:   make([]int, 0, len(shards)),
+        ParityShards: make([]int, 0, len(shards)),
         StripeMembers: make([]StripeMember, len(shards)),
     }
-    
+
     // Write shards in parallel
     var wg sync.WaitGroup
+    var blockMu sync.Mutex  // Protect block descriptor updates
     errChan := make(chan error, len(shards))
-    
+
     for i, shard := range shards {
         wg.Add(1)
         go func(shardIdx int, shardData []byte, nodeID int) {
             defer wg.Done()
-            
+
             isParity := shardIdx >= ofs.dataStripes
-            
+
             // Generate local path for shard
             localPath := ofs.generateShardPath(stripeNum, shardIdx, nodeID)
-            
+
             // Write shard to node
             if err := ofs.writeShardToNode(ctx, nodeID, localPath, shardData); err != nil {
                 errChan <- err
                 return
             }
-            
-            // Update block descriptor
+
+            // Update block descriptor under lock
             member := StripeMember{
                 NodeID:       nodeID,
                 LocalPath:    localPath,
                 ShardIndex:   shardIdx,
                 IsParityShard: isParity,
             }
-            
+
+            blockMu.Lock()
             block.StripeMembers[shardIdx] = member
-            
+
             if isParity {
                 block.ParityShards = append(block.ParityShards, nodeID)
             } else {
                 block.DataShards = append(block.DataShards, nodeID)
             }
-            
+            blockMu.Unlock()
+
         }(i, shard, nodes[i])
     }
-    
+
     wg.Wait()
     close(errChan)
     

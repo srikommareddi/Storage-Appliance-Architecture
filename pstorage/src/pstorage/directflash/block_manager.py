@@ -128,6 +128,7 @@ class BlockManager:
         if len(data) > self.block_size:
             raise ValueError(f"Data too large: {len(data)} > {self.block_size}")
 
+        # Hold lock for entire operation to prevent TOCTOU race
         async with self._lock:
             # Check if logical address already mapped
             if logical_address in self._l2p_table:
@@ -138,12 +139,17 @@ class BlockManager:
                 self._stats.valid_blocks -= 1
                 self._stats.invalid_blocks += 1
 
-        # Allocate new physical block
-        physical_id = await self.allocate_block()
-        if physical_id is None:
-            return -1, False
+            # Allocate new physical block (inline to keep lock held)
+            if not self._free_blocks:
+                return -1, False
 
-        async with self._lock:
+            # Get block with lowest erase count (simple wear leveling)
+            physical_id = min(
+                self._free_blocks, key=lambda b: self._blocks[b].erase_count
+            )
+            self._free_blocks.remove(physical_id)
+            self._stats.free_blocks -= 1
+
             # Write to physical block
             block = self._blocks[physical_id]
             block.data = data
@@ -251,15 +257,19 @@ class BlockManager:
 
             return True
 
-    def get_invalid_blocks(self) -> Iterator[int]:
+    async def get_invalid_blocks(self) -> list[int]:
         """Get all invalid (garbage) blocks."""
-        for block_id, block in self._blocks.items():
-            if block.state == BlockState.INVALID:
-                yield block_id
+        async with self._lock:
+            return [
+                block_id
+                for block_id, block in self._blocks.items()
+                if block.state == BlockState.INVALID
+            ]
 
-    def get_block_info(self, physical_id: int) -> PhysicalBlock | None:
+    async def get_block_info(self, physical_id: int) -> PhysicalBlock | None:
         """Get information about a physical block."""
-        return self._blocks.get(physical_id)
+        async with self._lock:
+            return self._blocks.get(physical_id)
 
     async def get_stats(self) -> dict:
         """Get block manager statistics."""

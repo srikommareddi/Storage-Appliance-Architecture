@@ -133,18 +133,20 @@ class SnapshotManager:
 
     async def get_snapshot(self, snapshot_id: str) -> Snapshot | None:
         """Get a snapshot by ID."""
-        return self._snapshots.get(snapshot_id)
+        async with self._lock:
+            return self._snapshots.get(snapshot_id)
 
     async def get_snapshot_by_name(
         self, volume_id: str, name: str
     ) -> Snapshot | None:
         """Get a snapshot by name within a volume."""
-        snapshot_ids = self._volume_snapshots.get(volume_id, [])
-        for sid in snapshot_ids:
-            snapshot = self._snapshots.get(sid)
-            if snapshot and snapshot.name == name:
-                return snapshot
-        return None
+        async with self._lock:
+            snapshot_ids = self._volume_snapshots.get(volume_id, [])
+            for sid in snapshot_ids:
+                snapshot = self._snapshots.get(sid)
+                if snapshot and snapshot.name == name:
+                    return snapshot
+            return None
 
     async def list_snapshots(
         self, volume_id: str | None = None
@@ -155,14 +157,15 @@ class SnapshotManager:
         Args:
             volume_id: Optional filter by volume ID
         """
-        if volume_id:
-            snapshot_ids = self._volume_snapshots.get(volume_id, [])
-            for sid in snapshot_ids:
-                snapshot = self._snapshots.get(sid)
-                if snapshot:
-                    yield snapshot
-        else:
-            for snapshot in self._snapshots.values():
+        async with self._lock:
+            if volume_id:
+                snapshot_ids = list(self._volume_snapshots.get(volume_id, []))
+                snapshots = [self._snapshots.get(sid) for sid in snapshot_ids]
+            else:
+                snapshots = list(self._snapshots.values())
+
+        for snapshot in snapshots:
+            if snapshot:
                 yield snapshot
 
     async def delete_snapshot(self, snapshot_id: str) -> bool:
@@ -206,14 +209,16 @@ class SnapshotManager:
         self, snapshot_id: str
     ) -> dict[int, VolumeBlock] | None:
         """Get block mapping from a snapshot."""
-        snapshot = self._snapshots.get(snapshot_id)
-        if not snapshot:
-            return None
-        return snapshot.blocks.copy()
+        async with self._lock:
+            snapshot = self._snapshots.get(snapshot_id)
+            if not snapshot:
+                return None
+            return snapshot.blocks.copy()
 
     async def get_stats(self) -> dict:
         """Get snapshot manager statistics."""
-        return {
-            "total_snapshots": self._stats.total_snapshots,
-            "snapshots_by_volume": dict(self._stats.snapshots_by_volume),
-        }
+        async with self._lock:
+            return {
+                "total_snapshots": self._stats.total_snapshots,
+                "snapshots_by_volume": dict(self._stats.snapshots_by_volume),
+            }

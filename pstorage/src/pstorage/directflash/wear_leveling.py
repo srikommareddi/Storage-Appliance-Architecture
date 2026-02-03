@@ -59,9 +59,10 @@ class WearLeveling:
                 self._write_counts.get(logical_address, 0) + 1
             )
 
-    def is_hot_data(self, logical_address: int, threshold: int = 10) -> bool:
+    async def is_hot_data(self, logical_address: int, threshold: int = 10) -> bool:
         """Check if data at address is hot (frequently written)."""
-        return self._write_counts.get(logical_address, 0) > threshold
+        async with self._lock:
+            return self._write_counts.get(logical_address, 0) > threshold
 
     async def should_level(self) -> bool:
         """Check if wear leveling is needed."""
@@ -78,35 +79,37 @@ class WearLeveling:
         Returns:
             Tuple of (source_block_id, dest_block_id) or (None, None)
         """
-        blocks = self.block_manager._blocks
+        # Hold block_manager lock to safely access internal state
+        async with self.block_manager._lock:
+            blocks = self.block_manager._blocks
 
-        # Find most worn valid block (source - contains data to move)
-        most_worn_valid = None
-        max_erase = -1
+            # Find most worn valid block (source - contains data to move)
+            most_worn_valid = None
+            max_erase = -1
 
-        # Find least worn free block (destination)
-        least_worn_free = None
-        min_erase = float("inf")
+            # Find least worn free block (destination)
+            least_worn_free = None
+            min_erase = float("inf")
 
-        for block_id, block in blocks.items():
-            if block.state == BlockState.VALID:
-                if block.erase_count > max_erase:
-                    max_erase = block.erase_count
-                    most_worn_valid = block_id
-            elif block.state == BlockState.FREE:
-                if block.erase_count < min_erase:
-                    min_erase = block.erase_count
-                    least_worn_free = block_id
+            for block_id, block in blocks.items():
+                if block.state == BlockState.VALID:
+                    if block.erase_count > max_erase:
+                        max_erase = block.erase_count
+                        most_worn_valid = block_id
+                elif block.state == BlockState.FREE:
+                    if block.erase_count < min_erase:
+                        min_erase = block.erase_count
+                        least_worn_free = block_id
 
-        # Only proceed if difference exceeds threshold
-        if (
-            most_worn_valid is not None
-            and least_worn_free is not None
-            and (max_erase - min_erase) > self.threshold
-        ):
-            return most_worn_valid, least_worn_free
+            # Only proceed if difference exceeds threshold
+            if (
+                most_worn_valid is not None
+                and least_worn_free is not None
+                and (max_erase - min_erase) > self.threshold
+            ):
+                return most_worn_valid, least_worn_free
 
-        return None, None
+            return None, None
 
     async def level_block(self, source_id: int, dest_id: int) -> bool:
         """
@@ -119,37 +122,39 @@ class WearLeveling:
         Returns:
             True if leveling was successful
         """
-        async with self._lock:
-            source = self.block_manager._blocks.get(source_id)
-            dest = self.block_manager._blocks.get(dest_id)
+        # Acquire locks in consistent order: block_manager first, then self
+        async with self.block_manager._lock:
+            async with self._lock:
+                source = self.block_manager._blocks.get(source_id)
+                dest = self.block_manager._blocks.get(dest_id)
 
-            if not source or not dest:
-                return False
+                if not source or not dest:
+                    return False
 
-            if source.state != BlockState.VALID or dest.state != BlockState.FREE:
-                return False
+                if source.state != BlockState.VALID or dest.state != BlockState.FREE:
+                    return False
 
-            # Copy data to destination
-            dest.data = source.data
-            dest.state = BlockState.VALID
-            dest.logical_address = source.logical_address
+                # Copy data to destination
+                dest.data = source.data
+                dest.state = BlockState.VALID
+                dest.logical_address = source.logical_address
 
-            # Update L2P mapping
-            if source.logical_address is not None:
-                self.block_manager._l2p_table[source.logical_address] = dest_id
+                # Update L2P mapping
+                if source.logical_address is not None:
+                    self.block_manager._l2p_table[source.logical_address] = dest_id
 
-            # Invalidate source
-            source.state = BlockState.INVALID
-            source.logical_address = None
+                # Invalidate source
+                source.state = BlockState.INVALID
+                source.logical_address = None
 
-            # Remove destination from free pool
-            self.block_manager._free_blocks.discard(dest_id)
-            self.block_manager._stats.free_blocks -= 1
-            self.block_manager._stats.invalid_blocks += 1
+                # Remove destination from free pool
+                self.block_manager._free_blocks.discard(dest_id)
+                self.block_manager._stats.free_blocks -= 1
+                self.block_manager._stats.invalid_blocks += 1
 
-            self._stats.blocks_moved += 1
+                self._stats.blocks_moved += 1
 
-            return True
+                return True
 
     async def run_leveling_pass(self) -> int:
         """
@@ -179,30 +184,38 @@ class WearLeveling:
 
     async def get_wear_distribution(self) -> dict[int, int]:
         """Get distribution of erase counts."""
-        distribution: dict[int, int] = {}
+        async with self.block_manager._lock:
+            distribution: dict[int, int] = {}
 
-        for block in self.block_manager._blocks.values():
-            bucket = (block.erase_count // 100) * 100  # Bucket by 100s
-            distribution[bucket] = distribution.get(bucket, 0) + 1
+            for block in self.block_manager._blocks.values():
+                bucket = (block.erase_count // 100) * 100  # Bucket by 100s
+                distribution[bucket] = distribution.get(bucket, 0) + 1
 
-        return dict(sorted(distribution.items()))
+            return dict(sorted(distribution.items()))
 
     async def get_stats(self) -> dict:
         """Get wear leveling statistics."""
-        distribution = await self.get_wear_distribution()
-        erase_counts = [b.erase_count for b in self.block_manager._blocks.values()]
+        async with self.block_manager._lock:
+            async with self._lock:
+                distribution: dict[int, int] = {}
+                erase_counts = []
 
-        # Calculate variance
-        if erase_counts:
-            mean = sum(erase_counts) / len(erase_counts)
-            variance = sum((x - mean) ** 2 for x in erase_counts) / len(erase_counts)
-        else:
-            variance = 0.0
+                for block in self.block_manager._blocks.values():
+                    erase_counts.append(block.erase_count)
+                    bucket = (block.erase_count // 100) * 100
+                    distribution[bucket] = distribution.get(bucket, 0) + 1
 
-        return {
-            "blocks_moved": self._stats.blocks_moved,
-            "strategy": self.strategy.value,
-            "threshold": self.threshold,
-            "wear_variance": variance,
-            "wear_distribution": distribution,
-        }
+                # Calculate variance
+                if erase_counts:
+                    mean = sum(erase_counts) / len(erase_counts)
+                    variance = sum((x - mean) ** 2 for x in erase_counts) / len(erase_counts)
+                else:
+                    variance = 0.0
+
+                return {
+                    "blocks_moved": self._stats.blocks_moved,
+                    "strategy": self.strategy.value,
+                    "threshold": self.threshold,
+                    "wear_variance": variance,
+                    "wear_distribution": dict(sorted(distribution.items())),
+                }

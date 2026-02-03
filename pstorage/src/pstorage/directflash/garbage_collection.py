@@ -54,7 +54,13 @@ class GarbageCollector:
 
     @property
     def state(self) -> GCState:
+        # Note: This is a quick read, but for accurate state, use get_state()
         return self._state
+
+    async def get_state(self) -> GCState:
+        """Get current GC state (thread-safe)."""
+        async with self._lock:
+            return self._state
 
     async def get_utilization(self) -> float:
         """Get current storage utilization."""
@@ -78,24 +84,26 @@ class GarbageCollector:
         async with self._lock:
             if self._state == GCState.STOPPED:
                 return 0
-
             self._state = GCState.RUNNING
 
         reclaimed = 0
 
-        # Find and erase all invalid blocks
-        invalid_blocks = list(self.block_manager.get_invalid_blocks())
+        # Find and erase all invalid blocks (now async)
+        invalid_blocks = await self.block_manager.get_invalid_blocks()
 
         for block_id in invalid_blocks:
-            if self._state == GCState.STOPPED:
-                break
+            # Check state under lock
+            async with self._lock:
+                if self._state == GCState.STOPPED:
+                    break
 
-            block = self.block_manager.get_block_info(block_id)
+            block = await self.block_manager.get_block_info(block_id)
             if block and block.state == BlockState.INVALID:
                 if await self.block_manager.erase_block(block_id):
                     reclaimed += 1
-                    self._stats.blocks_reclaimed += 1
-                    self._stats.bytes_reclaimed += self.block_manager.block_size
+                    async with self._lock:
+                        self._stats.blocks_reclaimed += 1
+                        self._stats.bytes_reclaimed += self.block_manager.block_size
 
             # Check if we've reached target
             utilization = await self.get_utilization()
@@ -116,11 +124,16 @@ class GarbageCollector:
         Args:
             interval: Check interval in seconds
         """
-        if self._gc_task is not None:
-            return
+        async with self._lock:
+            if self._gc_task is not None:
+                return
+            self._state = GCState.IDLE
 
         async def gc_loop():
-            while self._state != GCState.STOPPED:
+            while True:
+                async with self._lock:
+                    if self._state == GCState.STOPPED:
+                        break
                 try:
                     if await self.should_run():
                         await self.run_gc_cycle()
@@ -128,20 +141,21 @@ class GarbageCollector:
                 except asyncio.CancelledError:
                     break
 
-        self._state = GCState.IDLE
         self._gc_task = asyncio.create_task(gc_loop())
 
     async def stop_background_gc(self) -> None:
         """Stop background garbage collection."""
-        self._state = GCState.STOPPED
+        async with self._lock:
+            self._state = GCState.STOPPED
+            task = self._gc_task
+            self._gc_task = None
 
-        if self._gc_task is not None:
-            self._gc_task.cancel()
+        if task is not None:
+            task.cancel()
             try:
-                await self._gc_task
+                await task
             except asyncio.CancelledError:
                 pass
-            self._gc_task = None
 
     async def trigger_gc(self) -> int:
         """Manually trigger garbage collection."""
@@ -151,12 +165,13 @@ class GarbageCollector:
         """Get garbage collection statistics."""
         utilization = await self.get_utilization()
 
-        return {
-            "state": self._state.value,
-            "gc_runs": self._stats.gc_runs,
-            "blocks_reclaimed": self._stats.blocks_reclaimed,
-            "bytes_reclaimed": self._stats.bytes_reclaimed,
-            "current_utilization": utilization,
-            "gc_threshold": self.gc_threshold,
-            "gc_target": self.gc_target,
-        }
+        async with self._lock:
+            return {
+                "state": self._state.value,
+                "gc_runs": self._stats.gc_runs,
+                "blocks_reclaimed": self._stats.blocks_reclaimed,
+                "bytes_reclaimed": self._stats.bytes_reclaimed,
+                "current_utilization": utilization,
+                "gc_threshold": self.gc_threshold,
+                "gc_target": self.gc_target,
+            }

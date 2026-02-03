@@ -1,5 +1,6 @@
 """Compression Engine - LZ4 and Zstd compression support."""
 
+import threading
 from dataclasses import dataclass
 from enum import Enum
 from typing import Literal
@@ -59,6 +60,7 @@ class CompressionEngine:
         self._zstd_compressor = zstd.ZstdCompressor(level=level)
         self._zstd_decompressor = zstd.ZstdDecompressor()
 
+        self._stats_lock = threading.Lock()
         self._stats = {
             "blocks_compressed": 0,
             "blocks_skipped": 0,
@@ -77,7 +79,8 @@ class CompressionEngine:
             Tuple of (compressed_data_with_header, CompressionResult)
         """
         original_size = len(data)
-        self._stats["bytes_before"] += original_size
+        with self._stats_lock:
+            self._stats["bytes_before"] += original_size
 
         if self.algorithm == CompressionAlgorithm.NONE:
             result = CompressionResult(
@@ -101,8 +104,9 @@ class CompressionEngine:
         # Check if compression is beneficial
         if ratio < self.min_compression_ratio:
             # Not worth compressing
-            self._stats["blocks_skipped"] += 1
-            self._stats["bytes_after"] += original_size
+            with self._stats_lock:
+                self._stats["blocks_skipped"] += 1
+                self._stats["bytes_after"] += original_size
             result = CompressionResult(
                 original_size=original_size,
                 compressed_size=original_size,
@@ -117,8 +121,9 @@ class CompressionEngine:
             return header + data, result
 
         # Compression is beneficial
-        self._stats["blocks_compressed"] += 1
-        self._stats["bytes_after"] += compressed_size
+        with self._stats_lock:
+            self._stats["blocks_compressed"] += 1
+            self._stats["bytes_after"] += compressed_size
 
         result = CompressionResult(
             original_size=original_size,
@@ -181,17 +186,25 @@ class CompressionEngine:
 
     def get_compression_ratio(self) -> float:
         """Get overall compression ratio."""
-        if self._stats["bytes_after"] == 0:
-            return 1.0
-        return self._stats["bytes_before"] / self._stats["bytes_after"]
+        with self._stats_lock:
+            if self._stats["bytes_after"] == 0:
+                return 1.0
+            return self._stats["bytes_before"] / self._stats["bytes_after"]
 
     def get_stats(self) -> dict:
         """Get compression statistics."""
-        return {
-            **self._stats,
-            "compression_ratio": self.get_compression_ratio(),
-            "algorithm": self.algorithm.value,
-        }
+        with self._stats_lock:
+            # Calculate ratio inline to avoid nested lock
+            ratio = (
+                self._stats["bytes_before"] / self._stats["bytes_after"]
+                if self._stats["bytes_after"] > 0
+                else 1.0
+            )
+            return {
+                **self._stats,
+                "compression_ratio": ratio,
+                "algorithm": self.algorithm.value,
+            }
 
 
 class DeepCompressionEngine(CompressionEngine):

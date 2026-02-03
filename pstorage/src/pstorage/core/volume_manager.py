@@ -130,18 +130,23 @@ class VolumeManager:
 
     async def get_volume(self, volume_id: str) -> Volume | None:
         """Get a volume by ID."""
-        return self._volumes.get(volume_id)
+        async with self._lock:
+            return self._volumes.get(volume_id)
 
     async def get_volume_by_name(self, name: str) -> Volume | None:
         """Get a volume by name."""
-        for volume in self._volumes.values():
-            if volume.name == name:
-                return volume
-        return None
+        async with self._lock:
+            for volume in self._volumes.values():
+                if volume.name == name:
+                    return volume
+            return None
 
     async def list_volumes(self) -> AsyncIterator[Volume]:
         """List all volumes."""
-        for volume in self._volumes.values():
+        async with self._lock:
+            # Create snapshot of volumes to iterate safely
+            volumes_snapshot = list(self._volumes.values())
+        for volume in volumes_snapshot:
             yield volume
 
     async def update_volume(
@@ -266,10 +271,11 @@ class VolumeManager:
 
     async def get_block(self, volume_id: str, offset: int) -> VolumeBlock | None:
         """Get block at specific offset."""
-        volume = self._volumes.get(volume_id)
-        if not volume:
-            return None
-        return volume.blocks.get(offset)
+        async with self._lock:
+            volume = self._volumes.get(volume_id)
+            if not volume:
+                return None
+            return volume.blocks.get(offset)
 
     async def clone_volume(
         self, source_id: str, new_name: str, description: str = ""
@@ -279,21 +285,30 @@ class VolumeManager:
 
         Creates a new volume that shares blocks with the source.
         """
-        source = self._volumes.get(source_id)
-        if not source:
-            return None
+        # Get source volume info under lock
+        async with self._lock:
+            source = self._volumes.get(source_id)
+            if not source:
+                return None
+            # Capture source state atomically
+            source_size = source.size_bytes
+            source_name = source.name
+            source_tags = source.tags.copy()
+            source_blocks = dict(source.blocks)  # Snapshot of blocks
+            source_used = source.used_bytes
+            source_logical = source.logical_bytes
 
-        # Create new volume with same metadata
+        # Create new volume with same metadata (acquires lock internally)
         clone = await self.create_volume(
             name=new_name,
-            size_bytes=source.size_bytes,
-            description=description or f"Clone of {source.name}",
-            tags=source.tags.copy(),
+            size_bytes=source_size,
+            description=description or f"Clone of {source_name}",
+            tags=source_tags,
         )
 
         # Copy block references (not actual data - copy-on-write)
         async with self._lock:
-            for offset, block in source.blocks.items():
+            for offset, block in source_blocks.items():
                 clone.blocks[offset] = VolumeBlock(
                     offset=block.offset,
                     block_id=block.block_id,
@@ -301,18 +316,19 @@ class VolumeManager:
                     size=block.size,
                 )
 
-            clone.used_bytes = source.used_bytes
-            clone.logical_bytes = source.logical_bytes
+            clone.used_bytes = source_used
+            clone.logical_bytes = source_logical
             clone.physical_bytes = 0  # Clone doesn't add physical storage
 
         return clone
 
     async def get_stats(self) -> dict:
         """Get volume manager statistics."""
-        return {
-            "total_volumes": self._stats.total_volumes,
-            "total_provisioned_bytes": self._stats.total_provisioned_bytes,
-            "total_used_bytes": self._stats.total_used_bytes,
-            "total_logical_bytes": self._stats.total_logical_bytes,
-            "total_physical_bytes": self._stats.total_physical_bytes,
-        }
+        async with self._lock:
+            return {
+                "total_volumes": self._stats.total_volumes,
+                "total_provisioned_bytes": self._stats.total_provisioned_bytes,
+                "total_used_bytes": self._stats.total_used_bytes,
+                "total_logical_bytes": self._stats.total_logical_bytes,
+                "total_physical_bytes": self._stats.total_physical_bytes,
+            }
