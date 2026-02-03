@@ -1,0 +1,35 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "storage-appliance.fullname" . }}-config
+  labels:
+    {{- include "storage-appliance.labels" . | nindent 4 }}
+data:
+  storage.conf: |
+    # Storage Appliance Configuration
+
+    # Unity (S3 Object Storage) Configuration
+    [unity]
+    enabled = {{ .Values.unity.enabled }}
+    dedup_enabled = {{ .Values.unity.deduplication.enabled }}
+    dedup_mode = {{ .Values.unity.deduplication.mode }}
+    compression_enabled = {{ .Values.unity.compression.enabled }}
+    compression_algorithm = {{ .Values.unity.compression.algorithm }}
+
+    # PowerScale (Distributed Filesystem) Configuration
+    [powerscale]
+    enabled = {{ .Values.powerscale.enabled }}
+    cluster_name = {{ .Values.powerscale.cluster.name }}
+    cluster_nodes = {{ .Values.powerscale.cluster.nodes }}
+    ec_data_stripes = {{ .Values.powerscale.erasureCoding.dataStripes }}
+    ec_parity_stripes = {{ .Values.powerscale.erasureCoding.parityStripes }}
+
+    # NVMe-oF Configuration
+    [nvmeof]
+    enabled = {{ .Values.nvmeof.enabled }}
+    transport = {{ .Values.nvmeof.transport }}
+
+    # Monitoring Configuration
+    [monitoring]
+    prometheus_enabled = {{ .Values.monitoring.prometheus.enabled }}
+    prometheus_port = {{ .Values.monitoring.prometheus.port }}

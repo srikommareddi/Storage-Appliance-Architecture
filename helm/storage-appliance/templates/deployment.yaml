@@ -1,0 +1,108 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "storage-appliance.fullname" . }}
+  labels:
+    {{- include "storage-appliance.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "storage-appliance.fullname" . }}-headless
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "storage-appliance.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+      labels:
+        {{- include "storage-appliance.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.security.podSecurityContext | nindent 8 }}
+      containers:
+      - name: storage-appliance
+        image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        securityContext:
+          {{- toYaml .Values.security.containerSecurityContext | nindent 10 }}
+        ports:
+        - name: s3
+          containerPort: {{ .Values.service.s3Port }}
+          protocol: TCP
+        - name: nvmeof
+          containerPort: {{ .Values.service.nvmeofPort }}
+          protocol: TCP
+        - name: metrics
+          containerPort: 9090
+          protocol: TCP
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: UNITY_ENABLED
+          value: "{{ .Values.unity.enabled }}"
+        - name: POWERSCALE_ENABLED
+          value: "{{ .Values.powerscale.enabled }}"
+        - name: NVMEOF_ENABLED
+          value: "{{ .Values.nvmeof.enabled }}"
+        - name: DEDUP_MODE
+          value: "{{ .Values.unity.deduplication.mode }}"
+        - name: COMPRESSION_ALGORITHM
+          value: "{{ .Values.unity.compression.algorithm }}"
+        - name: ERASURE_CODING_DATA
+          value: "{{ .Values.powerscale.erasureCoding.dataStripes }}"
+        - name: ERASURE_CODING_PARITY
+          value: "{{ .Values.powerscale.erasureCoding.parityStripes }}"
+        resources:
+          {{- toYaml .Values.resources | nindent 10 }}
+        volumeMounts:
+        - name: data
+          mountPath: /data
+        - name: config
+          mountPath: /etc/storage
+        livenessProbe:
+          tcpSocket:
+            port: s3
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          tcpSocket:
+            port: s3
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      volumes:
+      - name: config
+        configMap:
+          name: {{ include "storage-appliance.fullname" . }}-config
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: [ "{{ .Values.persistence.accessMode }}" ]
+      {{- if .Values.persistence.storageClass }}
+      storageClassName: {{ .Values.persistence.storageClass }}
+      {{- end }}
+      resources:
+        requests:
+          storage: {{ .Values.persistence.size }}

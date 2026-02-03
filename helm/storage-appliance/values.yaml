@@ -1,0 +1,162 @@
+# Default values for storage-appliance
+replicaCount: 3
+
+image:
+  repository: storage-appliance
+  pullPolicy: IfNotPresent
+  tag: "latest"
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# Service configuration
+service:
+  type: ClusterIP
+  # S3 API port
+  s3Port: 9000
+  # NVMe-oF port
+  nvmeofPort: 4420
+
+# Unity (S3 Object Storage) configuration
+unity:
+  enabled: true
+  deduplication:
+    enabled: true
+    mode: "inline"  # inline or post-process
+  compression:
+    enabled: true
+    algorithm: "zstd"  # gzip, lz4, or zstd
+  storage:
+    capacity: "100Gi"
+    class: "fast-ssd"
+
+# PowerScale (Distributed Filesystem) configuration
+powerscale:
+  enabled: true
+  cluster:
+    name: "storage-cluster"
+    nodes: 3
+  erasureCoding:
+    dataStripes: 4
+    parityStripes: 2
+  storage:
+    capacity: "1Ti"
+    class: "standard"
+
+# VPLEX Metro Clustering configuration
+vplex:
+  enabled: false
+  sites:
+    - name: "DC1"
+      location: "us-west"
+    - name: "DC2"
+      location: "us-east"
+  maxLatency: "5ms"
+  witnessEnabled: true
+
+# NVMe-oF configuration
+nvmeof:
+  enabled: true
+  transport: "tcp"  # tcp or rdma
+  subsystems:
+    - nqn: "nqn.2024-01.com.storage:subsys1"
+      namespaces:
+        - nsid: 1
+          size: "100Gi"
+          blockSize: 4096
+
+# Storage classes
+storageClasses:
+  - name: fast-ssd
+    provisioner: storage-appliance/unity
+    parameters:
+      type: "ssd"
+      tier: "STANDARD"
+  - name: standard
+    provisioner: storage-appliance/powerscale
+    parameters:
+      protection: "4+2"
+      tier: "STANDARD"
+
+# Resource limits
+resources:
+  limits:
+    cpu: "4"
+    memory: "8Gi"
+  requests:
+    cpu: "2"
+    memory: "4Gi"
+
+# Node selector
+nodeSelector:
+  storage-node: "true"
+
+# Tolerations
+tolerations:
+  - key: "storage"
+    operator: "Equal"
+    value: "dedicated"
+    effect: "NoSchedule"
+
+# Affinity rules
+affinity:
+  podAntiAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchExpressions:
+            - key: app
+              operator: In
+              values:
+                - storage-appliance
+        topologyKey: "kubernetes.io/hostname"
+
+# Persistence
+persistence:
+  enabled: true
+  storageClass: "local-path"
+  accessMode: ReadWriteOnce
+  size: "500Gi"
+
+# Monitoring
+monitoring:
+  enabled: true
+  prometheus:
+    enabled: true
+    port: 9090
+  grafana:
+    enabled: true
+    dashboards: true
+
+# Security
+security:
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    fsGroup: 1000
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+    readOnlyRootFilesystem: true
+
+# Network policies
+networkPolicy:
+  enabled: true
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: default
+      ports:
+        - protocol: TCP
+          port: 9000
+        - protocol: TCP
+          port: 4420
+
+# Service monitor for Prometheus
+serviceMonitor:
+  enabled: true
+  interval: 30s
+  scrapeTimeout: 10s

@@ -1,0 +1,20 @@
+apiVersion: v2
+name: storage-appliance
+description: Enterprise Storage Appliance with S3, Distributed Filesystem, and NVMe-oF
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+keywords:
+  - storage
+  - s3
+  - object-storage
+  - distributed-filesystem
+  - nvme-of
+  - deduplication
+  - erasure-coding
+maintainers:
+  - name: Srilakshmi
+    email: contact@example.com
+home: https://github.com/srikommareddi/Storage-Appliance-Architecture
+sources:
+  - https://github.com/srikommareddi/Storage-Appliance-Architecture
