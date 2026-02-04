@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from ..core.config import get_settings
 from ..core.controller import get_controller
 from ..activecluster.cluster import get_cluster
-from .routes import metrics_router, replication_router, snapshots_router, volumes_router
+from .routes import analytics_router, metrics_router, replication_router, snapshots_router, volumes_router
 from .routes.snapshots import global_router as global_snapshots_router
 
 
@@ -47,6 +47,7 @@ app = FastAPI(
     - **Data Reduction**: Deduplication, compression, pattern removal
     - **High Availability**: Active-active replication, automatic failover
     - **Flash Management**: Wear leveling, garbage collection
+    - **Predictive Analytics**: Capacity forecasting, data tiering, health monitoring
     - **RESTful APIs**: Volume, snapshot, and replication management
     """,
     version="0.1.0",
@@ -68,6 +69,7 @@ app.include_router(snapshots_router, prefix="/api/v1")
 app.include_router(global_snapshots_router, prefix="/api/v1")
 app.include_router(replication_router, prefix="/api/v1")
 app.include_router(metrics_router, prefix="/api/v1")
+app.include_router(analytics_router, prefix="/api/v1")
 
 
 @app.get("/")

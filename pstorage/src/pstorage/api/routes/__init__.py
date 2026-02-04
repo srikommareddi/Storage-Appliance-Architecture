@@ -1,5 +1,6 @@
 """API routes."""
 
+from .analytics import router as analytics_router
 from .metrics import router as metrics_router
 from .replication import router as replication_router
 from .snapshots import router as snapshots_router
@@ -10,4 +11,5 @@ __all__ = [
     "snapshots_router",
     "replication_router",
     "metrics_router",
+    "analytics_router",
 ]
