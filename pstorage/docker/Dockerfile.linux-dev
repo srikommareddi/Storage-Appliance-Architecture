@@ -1,0 +1,72 @@
+# Dockerfile for Linux development environment
+# Supports Go NVMe/SPDK components (compilation and simulation testing)
+#
+# Build:   docker build -t pstorage-linux-dev -f docker/Dockerfile.linux-dev .
+# Run:     docker run -it --rm -v $(pwd):/app pstorage-linux-dev bash
+
+FROM ubuntu:22.04
+
+# Avoid interactive prompts
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install base dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    git \
+    curl \
+    wget \
+    pkg-config \
+    python3 \
+    python3-pip \
+    python3-venv \
+    sudo \
+    vim \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Go 1.21
+RUN wget -q https://go.dev/dl/go1.21.6.linux-amd64.tar.gz \
+    && tar -C /usr/local -xzf go1.21.6.linux-amd64.tar.gz \
+    && rm go1.21.6.linux-amd64.tar.gz
+
+ENV PATH="/usr/local/go/bin:${PATH}"
+ENV GOPATH="/go"
+ENV PATH="${GOPATH}/bin:${PATH}"
+
+# Install SPDK dependencies (for full NVMe support)
+RUN apt-get update && apt-get install -y \
+    libaio-dev \
+    libcunit1-dev \
+    libnuma-dev \
+    libssl-dev \
+    libfuse3-dev \
+    uuid-dev \
+    meson \
+    ninja-build \
+    nasm \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user
+RUN useradd -m -s /bin/bash developer \
+    && echo "developer ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+
+# Set working directory
+WORKDIR /app
+
+# Copy project files
+COPY . .
+
+# Fix permissions
+RUN chown -R developer:developer /app
+
+USER developer
+
+# Install Python dependencies
+RUN python3 -m venv /home/developer/venv \
+    && /home/developer/venv/bin/pip install --upgrade pip \
+    && /home/developer/venv/bin/pip install -e ".[dev]" || true
+
+# Build Go components (without SPDK - simulation mode)
+RUN go build -tags=nosdk ./powerscale/... || true
+
+# Default command
+CMD ["/bin/bash"]
